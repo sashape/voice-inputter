@@ -1,11 +1,13 @@
 {
     "model_path": "models/sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16",
     "device_name": null,
-    "wake_words": ["джарвис", "компьютер"],
+    "wake_words": ["компьютер", "джарвис"],
     "stop_words": ["стоп", "хватит", "достаточно"],
     "silence_timeout": 6.0,
     "hotkey": "ctrl+alt+space",
     "overlay_scale": 1.0,
+    "overlay_mode": "always",
+    "hotwords_score": 2.0,
     "live_typing": true,
     "append_space": true,
     "capitalize": true

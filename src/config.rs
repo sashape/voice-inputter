@@ -24,6 +24,12 @@ pub struct Config {
     /// Live-ввод: печатать слова сразу (true) или только после паузы (false).
     #[serde(default = "default_true")]
     pub live_typing: bool,
+    /// Режим показа оверлея: "always" | "dictation" | "hidden".
+    #[serde(default = "default_overlay_mode")]
+    pub overlay_mode: String,
+    /// Контекстное усиление wake/stop-слов (0 = выкл/greedy; >0 = beam-search).
+    #[serde(default = "default_hotwords_score")]
+    pub hotwords_score: f32,
     /// Пробел после каждой фразы.
     pub append_space: bool,
     /// Заглавная буква в начале фразы.
@@ -41,6 +47,8 @@ impl Default for Config {
             hotkey: default_hotkey(),
             overlay_scale: default_scale(),
             live_typing: true,
+            overlay_mode: default_overlay_mode(),
+            hotwords_score: default_hotwords_score(),
             append_space: true,
             capitalize: true,
         }
@@ -49,6 +57,14 @@ impl Default for Config {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_overlay_mode() -> String {
+    "always".into()
+}
+
+fn default_hotwords_score() -> f32 {
+    2.0
 }
 
 fn default_hotkey() -> String {
