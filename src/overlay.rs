@@ -6,11 +6,13 @@
 //! (прямая альфа); `ui.rs` конвертирует его в premultiplied BGRA для
 //! UpdateLayeredWindow. Раскладка/hit-test — здесь же.
 
+use crate::paint::{blur, col, lerp, lerp_f, lin, radial, round_rect, sc, sd_rrect, Rgb};
 use std::cell::RefCell;
 use tiny_skia::{
-    Color, FillRule, GradientStop, LinearGradient, LineCap, Mask, Paint, PathBuilder, Pixmap,
-    PixmapPaint, Point, RadialGradient, Shader, SpreadMode, Stroke, Transform,
+    Color, FillRule, LineCap, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform,
 };
+
+pub use crate::paint::smooth_k;
 
 // ── размеры окна и раскладка (логич. px) ──────────────────────────────────
 pub const OV_W: i32 = 300;
@@ -39,7 +41,6 @@ const GEAR_CX: f32 = 129.0; // над центром укороченной пи
 const CLOSE_CX: f32 = 171.0;
 
 // ── палитра ────────────────────────────────────────────────────────────────
-type Rgb = (u8, u8, u8);
 const VIOLET: Rgb = (139, 124, 247);
 const MAGENTA: Rgb = (199, 125, 240);
 const PINK: Rgb = (232, 121, 185);
@@ -103,15 +104,6 @@ pub fn animate(bars: &mut [f32], level: f32, t: f32, dt: f32, recording: bool) {
         let tau = if recording { 0.05 } else { 0.313 };
         bars[i] += (target - bars[i]) * smooth_k(dt, tau);
     }
-}
-
-/// Коэффициент экспоненциального сглаживания, независимый от частоты кадров:
-/// доля пути к цели за время `dt` при постоянной времени `tau`.
-pub fn smooth_k(dt: f32, tau: f32) -> f32 {
-    if tau <= 0.0 {
-        return 1.0;
-    }
-    (1.0 - (-dt / tau).exp()).clamp(0.0, 1.0)
 }
 
 // ── hit-test ──────────────────────────────────────────────────────────────
@@ -450,42 +442,8 @@ fn draw_controls(pm: &mut Pixmap, s: f32, hover_gear: f32, hover_close: f32) {
 }
 
 // ── помощники ────────────────────────────────────────────────────────────
-fn sc(v: f32, s: f32) -> f32 {
-    v * s
-}
-
 fn pill_path(s: f32) -> tiny_skia::Path {
     round_rect(sc(PILL_X, s), sc(PILL_Y, s), sc(PILL_W, s), sc(PILL_H, s), sc(PILL_R, s))
-}
-
-fn round_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> tiny_skia::Path {
-    let r = r.min(w / 2.0).min(h / 2.0);
-    let k = 0.5523 * r;
-    let mut pb = PathBuilder::new();
-    pb.move_to(x + r, y);
-    pb.line_to(x + w - r, y);
-    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
-    pb.line_to(x + w, y + h - r);
-    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
-    pb.line_to(x + r, y + h);
-    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
-    pb.line_to(x, y + r);
-    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
-    pb.close();
-    pb.finish().unwrap()
-}
-
-fn lin(x0: f32, y0: f32, x1: f32, y1: f32, stops: Vec<(f32, Color)>) -> Shader<'static> {
-    let gs = stops.into_iter().map(|(p, c)| GradientStop::new(p, c)).collect();
-    LinearGradient::new(Point::from_xy(x0, y0), Point::from_xy(x1, y1), gs, SpreadMode::Pad, Transform::identity())
-        .unwrap_or_else(|| Shader::SolidColor(Color::from_rgba8(0, 0, 0, 0)))
-}
-
-fn radial(cx: f32, cy: f32, r: f32, stops: Vec<(f32, Color)>) -> Shader<'static> {
-    let gs = stops.into_iter().map(|(p, c)| GradientStop::new(p, c)).collect();
-    let c = Point::from_xy(cx, cy);
-    RadialGradient::new(c, c, r, gs, SpreadMode::Pad, Transform::identity())
-        .unwrap_or_else(|| Shader::SolidColor(Color::from_rgba8(0, 0, 0, 0)))
 }
 
 /// Маска по форме пилюли (для клиппинга свечения внутрь).
@@ -506,23 +464,6 @@ fn rot_scale_at(deg: f32, sl: f32, cx: f32, cy: f32) -> Transform {
     Transform::from_row(sx, ky, kx, sy, tx, ty)
 }
 
-fn lerp_f(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t.clamp(0.0, 1.0)
-}
-
-fn col(c: Rgb, a: f32) -> Color {
-    Color::from_rgba8(c.0, c.1, c.2, (a * 255.0) as u8)
-}
-
-fn lerp(a: Rgb, b: Rgb, t: f32) -> Rgb {
-    let t = t.clamp(0.0, 1.0);
-    (
-        (a.0 as f32 + (b.0 as f32 - a.0 as f32) * t) as u8,
-        (a.1 as f32 + (b.1 as f32 - a.1 as f32) * t) as u8,
-        (a.2 as f32 + (b.2 as f32 - a.2 as f32) * t) as u8,
-    )
-}
-
 fn palette_at(u: f32) -> Rgb {
     let p = u.clamp(0.0, 1.0) * (PALETTE.len() as f32 - 1.0);
     let i = p.floor() as usize;
@@ -538,55 +479,6 @@ fn aurora_at(u: f32) -> Rgb {
 
 fn dist(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
-}
-
-/// Знаковое расстояние до скруглённого прямоугольника (для hit-test).
-fn sd_rrect(px: f32, py: f32, hw: f32, hh: f32, r: f32) -> f32 {
-    let qx = px.abs() - (hw - r);
-    let qy = py.abs() - (hh - r);
-    let outside = qx.max(0.0).hypot(qy.max(0.0));
-    let inside = qx.max(qy).min(0.0);
-    outside + inside - r
-}
-
-// быстрый разделимый box-blur (3 прохода ≈ гаусс) по premultiplied RGBA
-fn blur(pm: &mut Pixmap, radius: usize) {
-    if radius == 0 {
-        return;
-    }
-    let (w, h) = (pm.width() as usize, pm.height() as usize);
-    for _ in 0..3 {
-        box_pass(pm.data_mut(), w, h, radius, true);
-        box_pass(pm.data_mut(), w, h, radius, false);
-    }
-}
-
-fn box_pass(data: &mut [u8], w: usize, h: usize, r: usize, horiz: bool) {
-    let (n, m) = if horiz { (h, w) } else { (w, h) };
-    if m == 0 {
-        return;
-    }
-    let win = (2 * r + 1) as u32;
-    let mut line = vec![0u8; m * 4];
-    for a in 0..n {
-        for b in 0..m {
-            let idx = if horiz { (a * w + b) * 4 } else { (b * w + a) * 4 };
-            line[b * 4..b * 4 + 4].copy_from_slice(&data[idx..idx + 4]);
-        }
-        for ch in 0..4 {
-            let mut sum: u32 = line[ch] as u32 * (r as u32);
-            for k in 0..=r.min(m - 1) {
-                sum += line[k * 4 + ch] as u32;
-            }
-            for b in 0..m {
-                let idx = if horiz { (a * w + b) * 4 } else { (b * w + a) * 4 };
-                data[idx + ch] = (sum / win) as u8;
-                let add = line[(b + r + 1).min(m - 1) * 4 + ch] as u32;
-                let subv = line[b.saturating_sub(r) * 4 + ch] as u32;
-                sum = sum + add - subv;
-            }
-        }
-    }
 }
 
 #[cfg(test)]

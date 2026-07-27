@@ -30,6 +30,8 @@ jobs:
           Invoke-WebRequest $url -OutFile model.tar.bz2
           tar -xf model.tar.bz2 -C models
 
+      # Полный офлайн-пакет. Отдельно публикуем и «лёгкий» exe: он сам
+      # предложит скачать модель при первом запуске.
       - name: Package dist (exe + model + config)
         shell: pwsh
         run: |
@@ -49,8 +51,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: >
           gh release create ${{ github.ref_name }}
-          VoiceInputter-win-x64.zip
-          target/release/voice-inputter.exe
+          "VoiceInputter-win-x64.zip#Полный пакет (exe + модель, офлайн)"
+          "target/release/voice-inputter.exe#Только exe (модель скачается при первом запуске)"
           --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

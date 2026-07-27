@@ -11,11 +11,18 @@
 mod audio;
 mod config;
 mod engine;
+mod icons;
+mod model;
+mod model_ui;
 mod overlay;
+mod paint;
+mod settings;
 mod shared;
+mod startup;
 mod stt;
 mod typer;
 mod ui;
+mod win_ui;
 
 use config::Config;
 

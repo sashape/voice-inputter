@@ -1,4 +1,4 @@
-# Собирает автономный дистрибутив в .\dist (exe + модель + config).
+﻿# Собирает автономный дистрибутив в .\dist (exe + модель + config).
 # Exe самодостаточный: ни DLL, ни VC++ Redistributable не нужны.
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path

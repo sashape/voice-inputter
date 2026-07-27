@@ -66,16 +66,40 @@ fn build_recognizer() -> Result<Recognizer, String> {
     Recognizer::new(&model_path, 16000, &hot, cfg.hotwords_score)
 }
 
+/// Ждёт появления модели: по `Reload` пробует собрать распознаватель заново.
+/// `None` — пришёл Shutdown.
+fn wait_for_model(rx: &Receiver<WorkerMsg>) -> Option<Recognizer> {
+    for msg in rx.iter() {
+        match msg {
+            WorkerMsg::Shutdown => return None,
+            WorkerMsg::Reload => match build_recognizer() {
+                Ok(r) => return Some(r),
+                Err(e) => eprintln!("[engine] модель всё ещё недоступна: {e}"),
+            },
+            _ => {} // распознавать нечем — остальные сообщения игнорируем
+        }
+    }
+    None
+}
+
 pub fn run(rx: Receiver<WorkerMsg>) {
     let cfg0 = shared().config.lock().unwrap().clone();
 
     let mut stt = match build_recognizer() {
         Ok(r) => r,
         Err(e) => {
-            ui::error_box(&format!(
-                "Не удалось загрузить модель распознавания.\n\n{e}\n\nПроверьте model_path в config.json (папка модели sherpa-onnx)."
-            ));
-            return;
+            // Модели ещё нет (первый запуск — её как раз качают) либо она битая.
+            // Не выходим: ждём Reload, иначе диктовка была бы мертва до перезапуска.
+            if crate::model::installed() {
+                ui::error_box(&format!(
+                    "Не удалось загрузить модель распознавания.\n\n{e}\n\nПроверьте model_path в config.json (папка модели sherpa-onnx)."
+                ));
+            }
+            eprintln!("[engine] распознаватель не готов: {e}");
+            match wait_for_model(&rx) {
+                Some(r) => r,
+                None => return,
+            }
         }
     };
     eprintln!("[engine] модель sherpa загружена");

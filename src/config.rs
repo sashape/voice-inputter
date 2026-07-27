@@ -119,20 +119,52 @@ pub fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn config_path() -> PathBuf {
-    exe_dir().join("config.json")
+/// Куда писать данные (config.json, модель): рядом с exe, если туда можно
+/// писать (портативная папка), иначе `%LOCALAPPDATA%\VoiceInputter` — так
+/// приложение работает и из `Program Files`, где запись запрещена.
+pub fn data_dir() -> PathBuf {
+    let exe = exe_dir();
+    if writable(&exe) {
+        return exe;
+    }
+    let local = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| exe.clone())
+        .join("VoiceInputter");
+    if std::fs::create_dir_all(&local).is_ok() {
+        local
+    } else {
+        exe
+    }
 }
 
-/// Ищет ресурс (модель/DLL) сначала в текущем каталоге, потом рядом с exe.
+/// Проверяет запись пробным файлом — прав по ACL мало, важен реальный результат
+/// (например, виртуализация записи в Program Files).
+fn writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".vi-write-test");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn config_path() -> PathBuf {
+    data_dir().join("config.json")
+}
+
+/// Ищет ресурс (модель/DLL): текущий каталог → рядом с exe → каталог данных.
 pub fn resolve_resource(name: &str) -> Option<PathBuf> {
-    let candidates = [PathBuf::from(name), exe_dir().join(name)];
+    let candidates = [PathBuf::from(name), exe_dir().join(name), data_dir().join(name)];
     candidates.into_iter().find(|p| p.exists())
 }
 
 impl Config {
     pub fn load() -> Config {
-        // конфиг ищем рядом с exe, затем в текущем каталоге
-        for p in [config_path(), PathBuf::from("config.json")] {
+        // конфиг ищем в каталоге данных, затем рядом с exe и в текущем каталоге
+        for p in [config_path(), exe_dir().join("config.json"), PathBuf::from("config.json")] {
             if let Ok(text) = std::fs::read_to_string(&p) {
                 if let Ok(cfg) = serde_json::from_str::<Config>(&text) {
                     return cfg;

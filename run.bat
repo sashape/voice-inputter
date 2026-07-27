@@ -3,15 +3,12 @@ REM Запуск Voice Inputter (release). Рабочий каталог = па�
 REM чтобы нашлись config.json и папка модели.
 cd /d "%~dp0"
 
-if not exist "target\release\voice-inputter.exe" (
-    echo Бинарник не собран. Выполните:  cargo build --release
-    pause
-    exit /b 1
-)
-if not exist "models" (
-    echo Папка models не найдена. Сначала запустите:  powershell -ExecutionPolicy Bypass -File setup.ps1
+if not exist "targeteleaseoice-inputter.exe" (
+    echo Binary not built. Run:  cargo build --release
     pause
     exit /b 1
 )
 
-start "" "target\release\voice-inputter.exe"
+REM Папка models не обязательна: если модели нет, приложение предложит
+REM скачать её при первом запуске (или запустите setup.ps1).
+start "" "targeteleaseoice-inputter.exe"

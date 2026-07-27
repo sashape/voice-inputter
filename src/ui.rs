@@ -12,6 +12,7 @@ use crate::shared::{
     current_level, is_dictating, is_enabled, pack_hwnd, shared, unpack_hwnd, WorkerMsg,
 };
 use crate::audio;
+use crate::icons::Tray;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::time::Instant;
@@ -23,15 +24,14 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject,
-    GetDC, ReleaseDC, SelectObject, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, HBITMAP, HDC, HFONT, LOGFONTW,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
 };
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_CONTEXT_UNAWARE,
+    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, TrackMouseEvent, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
@@ -58,15 +58,7 @@ const ID_SETTINGS: usize = 1;
 const ID_ENABLED: usize = 2;
 const ID_DICTATE: usize = 3;
 const ID_QUIT: usize = 4;
-
-const ID_COMBO: i32 = 101;
-const ID_EDIT: i32 = 102;
-const ID_SAVE: i32 = 103;
-const ID_CANCEL: i32 = 104;
-const ID_STOP: i32 = 105;
-const ID_HOTKEY: i32 = 106;
-const ID_MODE: i32 = 107;
-const ID_LIVE: i32 = 108;
+const ID_MODEL: usize = 5;
 
 use overlay::{OV_H, OV_W};
 
@@ -84,7 +76,6 @@ struct Ui {
     hinstance: windows::Win32::Foundation::HINSTANCE,
     main: HWND,
     overlay_hwnd: HWND,
-    settings_hwnd: HWND,
     overlay: Option<Overlay>,
     bars: Vec<f32>,
     level_smooth: f32,
@@ -103,14 +94,6 @@ struct Ui {
     dismissed: bool,
     icons: [HICON; 3],
     stream: Option<cpal::Stream>,
-    settings_combo: HWND,
-    settings_edit: HWND,
-    settings_stop: HWND,
-    settings_hotkey: HWND,
-    settings_mode: HWND,
-    settings_live: HWND,
-    settings_font: HFONT,
-    settings_devices: Vec<String>,
 }
 
 impl Default for Ui {
@@ -119,7 +102,6 @@ impl Default for Ui {
             hinstance: Default::default(),
             main: HWND::default(),
             overlay_hwnd: HWND::default(),
-            settings_hwnd: HWND::default(),
             overlay: None,
             bars: vec![0.06; overlay::N_BARS],
             level_smooth: 0.0,
@@ -138,14 +120,6 @@ impl Default for Ui {
             dismissed: false,
             icons: [HICON::default(); 3],
             stream: None,
-            settings_combo: HWND::default(),
-            settings_edit: HWND::default(),
-            settings_stop: HWND::default(),
-            settings_hotkey: HWND::default(),
-            settings_mode: HWND::default(),
-            settings_live: HWND::default(),
-            settings_font: HFONT::default(),
-            settings_devices: Vec::new(),
         }
     }
 }
@@ -246,12 +220,7 @@ pub fn run() {
         )
         .expect("overlay window");
 
-        let isz = (16.0 * GetDpiForSystem() as f32 / 96.0).round() as i32;
-        let icons = [
-            make_icon((90, 150, 245), isz),  // idle
-            make_icon((60, 200, 90), isz),   // dictating
-            make_icon((140, 140, 140), isz), // disabled
-        ];
+        let icons = build_tray_icons();
 
         let init_scale = overlay_scale_for(overlay_hwnd);
         let overlay = create_overlay_gdi(init_scale);
@@ -293,6 +262,11 @@ pub fn run() {
         // таймер анимации: старт в «покойном» режиме (оверлей скрыт),
         // ускоряется до TIMER_FAST + timeBeginPeriod, когда становится виден
         SetTimer(main, OVERLAY_TIMER, TIMER_IDLE, None);
+
+        // первый запуск без модели — предлагаем скачать её сразу
+        if !crate::model::installed() {
+            crate::model_ui::open();
+        }
 
         eprintln!("[ui] запущено. Иконка в трее.");
 
@@ -349,18 +323,6 @@ unsafe fn register_classes(hinstance: windows::Win32::Foundation::HINSTANCE) {
         ..Default::default()
     };
     RegisterClassW(&overlay);
-
-    let settings = WNDCLASSW {
-        lpfnWndProc: Some(settings_wndproc),
-        hInstance: hinstance,
-        lpszClassName: w!("VoiceInputterSettings"),
-        hCursor: cursor,
-        hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(
-            (windows::Win32::Graphics::Gdi::COLOR_WINDOW.0 + 1) as isize as *mut c_void,
-        ),
-        ..Default::default()
-    };
-    RegisterClassW(&settings);
 }
 
 // ── главное окно ─────────────────────────────────────────────────────────
@@ -392,6 +354,16 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 }
                 LRESULT(0)
             }
+            // смена темы Windows приходит как WM_SETTINGCHANGE("ImmersiveColorSet")
+            WM_SETTINGCHANGE => {
+                if wp.0 == 0 && lp.0 != 0 {
+                    let name = PCWSTR(lp.0 as *const u16).to_string().unwrap_or_default();
+                    if name == "ImmersiveColorSet" {
+                        refresh_tray_icons(hwnd);
+                    }
+                }
+                LRESULT(0)
+            }
             WM_COMMAND => {
                 // команды из трей-меню приходят сюда через WM_COMMAND не идут
                 // (используем TPM_RETURNCMD), но оставим на всякий случай
@@ -408,6 +380,25 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
 }
 
 // ── трей ─────────────────────────────────────────────────────────────────
+/// Иконки трея под текущий DPI и тему Windows (порядок: покой, диктовка, выкл).
+fn build_tray_icons() -> [HICON; 3] {
+    let isz = unsafe { (16.0 * GetDpiForSystem() as f32 / 96.0).round() as i32 };
+    [Tray::Idle, Tray::Rec, Tray::Off].map(|s| crate::icons::tray_icon(s, isz))
+}
+
+/// Пересоздать иконки трея — например, когда Windows переключила светлую/тёмную
+/// тему: на светлой панели задач белый глиф не виден, нужен тёмный.
+fn refresh_tray_icons(hwnd: HWND) {
+    let icons = build_tray_icons();
+    let old = UI.with_borrow_mut(|ui| std::mem::replace(&mut ui.icons, icons));
+    update_tray_icon(hwnd);
+    for i in old {
+        unsafe {
+            let _ = DestroyIcon(i);
+        }
+    }
+}
+
 fn tray_data(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -475,6 +466,12 @@ fn show_tray_menu(hwnd: HWND) {
 
         let set_label = wide("Настройки…");
         AppendMenuW(menu, MF_STRING, ID_SETTINGS, PCWSTR(set_label.as_ptr())).ok();
+
+        // пункт появляется, только если модель ещё не установлена
+        let model_label = wide("Загрузить модель…");
+        if !crate::model::installed() {
+            AppendMenuW(menu, MF_STRING, ID_MODEL, PCWSTR(model_label.as_ptr())).ok();
+        }
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()).ok();
         let quit_label = wide("Выход");
         AppendMenuW(menu, MF_STRING, ID_QUIT, PCWSTR(quit_label.as_ptr())).ok();
@@ -498,6 +495,7 @@ fn show_tray_menu(hwnd: HWND) {
             ID_DICTATE => crate::shared::send_worker(WorkerMsg::Toggle),
             ID_ENABLED => crate::shared::send_worker(WorkerMsg::SetEnabled(!is_enabled())),
             ID_SETTINGS => open_settings(),
+            ID_MODEL => crate::model_ui::open(),
             ID_QUIT => {
                 DestroyWindow(hwnd).ok();
             }
@@ -864,327 +862,56 @@ fn draw_overlay(ui: &Ui) {
     }
 }
 
-// ── иконки трея ──────────────────────────────────────────────────────────
-fn make_icon(color: (u8, u8, u8), size: i32) -> HICON {
-    unsafe {
-        let mut bmi = BITMAPINFO::default();
-        bmi.bmiHeader = BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: size,
-            biHeight: -size,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        };
-        let mut bits: *mut c_void = std::ptr::null_mut();
-        let dc = CreateCompatibleDC(HDC::default());
-        let dib =
-            CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0).unwrap();
-        let px = std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize);
-        let c = (size as f32 - 1.0) / 2.0;
-        let rad = size as f32 / 2.0 - 0.5;
-        for y in 0..size {
-            for x in 0..size {
-                let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
-                let idx = (y * size + x) as usize;
-                if d <= rad {
-                    px[idx] = 0xFF00_0000
-                        | ((color.0 as u32) << 16)
-                        | ((color.1 as u32) << 8)
-                        | color.2 as u32;
-                } else {
-                    px[idx] = 0;
-                }
-            }
-        }
-        // белый значок микрофона поверх круга — чтобы иконку нельзя было
-        // спутать с иконками других программ
-        let s = size as f32;
-        let bw = (s * 0.13).max(1.0); // полуширина тела микрофона
-        let body_top = s * 0.24;
-        let body_bot = s * 0.55;
-        let stem_bot = s * 0.70;
-        let base_half = s * 0.19;
-        let stem_hw = (s * 0.055).max(0.6);
-        for y in 0..size {
-            for x in 0..size {
-                let px_ = x as f32 + 0.5;
-                let py_ = y as f32 + 0.5;
-                let dx = px_ - c;
-                let body = dx.abs() <= bw && py_ >= body_top && py_ <= body_bot;
-                let stem = dx.abs() <= stem_hw && py_ > body_bot && py_ <= stem_bot;
-                let base = (py_ - stem_bot).abs() <= (s * 0.05).max(0.6) && dx.abs() <= base_half;
-                if body || stem || base {
-                    px[(y * size + x) as usize] = 0xFFFF_FFFF; // белый
-                }
-            }
-        }
-        // маска 1bpp, все нули (используется альфа цветного DIB); буфер с запасом
-        let zeros = vec![0u8; (size * size).max(64) as usize];
-        let mask = CreateBitmap(size, size, 1, 1, Some(zeros.as_ptr() as *const c_void));
-        let ii = ICONINFO {
-            fIcon: true.into(),
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: mask,
-            hbmColor: dib,
-        };
-        let icon = CreateIconIndirect(&ii).unwrap_or_default();
-        let _ = DeleteObject(dib);
-        let _ = DeleteObject(mask);
-        let _ = DeleteDC(dc);
-        icon
-    }
-}
-
 // ── окно настроек ────────────────────────────────────────────────────────
-fn make_ui_font() -> HFONT {
-    unsafe {
-        let mut lf = LOGFONTW {
-            lfHeight: -15, // ~11pt при 96 DPI
-            lfWeight: 400, // обычный
-            lfCharSet: DEFAULT_CHARSET,
-            lfQuality: CLEARTYPE_QUALITY,
-            ..Default::default()
-        };
-        for (i, c) in "Segoe UI".encode_utf16().enumerate().take(31) {
-            lf.lfFaceName[i] = c;
-        }
-        CreateFontIndirectW(&lf)
-    }
-}
-
+/// Открыть окно настроек (рисуется в `settings.rs`).
 fn open_settings() {
-    UI.with_borrow(|ui| {
-        if !ui.settings_hwnd.0.is_null() {
-            unsafe {
-                let _ = ShowWindow(ui.settings_hwnd, SW_SHOW);
-                let _ = SetForegroundWindow(ui.settings_hwnd);
-            }
-            return;
-        }
+    crate::settings::open();
+}
+
+/// Снять глобальный хоткей на время захвата нового сочетания в настройках.
+pub fn pause_hotkey() {
+    UI.with_borrow(|ui| unsafe {
+        let _ = UnregisterHotKey(ui.main, HOTKEY_ID);
     });
+}
 
-    let hinstance = UI.with_borrow(|ui| ui.hinstance);
-    unsafe {
-        // Делаем окно настроек DPI-unaware: ОС сама масштабирует его целиком
-        // (вместе со шрифтом) на HiDPI — без ручного пересчёта координат.
-        let prev_dpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+/// Вернуть глобальный хоткей из конфига.
+pub fn resume_hotkey() {
+    let hk = shared().config.lock().unwrap().hotkey.clone();
+    UI.with_borrow(|ui| unsafe {
+        reregister_hotkey(ui.main, &hk);
+    });
+}
 
-        let hwnd = CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
-            w!("VoiceInputterSettings"),
-            w!("Voice Inputter — Настройки"),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            456,
-            474,
-            HWND::default(),
-            HMENU::default(),
-            hinstance,
-            None,
-        )
-        .expect("settings window");
-
-        let font = make_ui_font();
-        let cfg = shared().config.lock().unwrap().clone();
-        let lm = 20i32; // левый отступ
-        let cw = 412i32; // ширина контролов
-
-        let mk = |class: PCWSTR, text: &Vec<u16>, style: WINDOW_STYLE, x, y, w_, h_, id: i32| -> HWND {
-            let c = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                class,
-                PCWSTR(text.as_ptr()),
-                WS_CHILD | WS_VISIBLE | style,
-                x,
-                y,
-                w_,
-                h_,
-                hwnd,
-                HMENU(id as isize as *mut c_void),
-                hinstance,
-                None,
-            )
-            .unwrap();
-            SendMessageW(c, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-            c
-        };
-
-        let mut y = 16i32;
-        mk(w!("STATIC"), &wide("Микрофон"), WINDOW_STYLE(0), lm, y, cw, 18, 0);
-        y += 22;
-        let combo = mk(
-            w!("COMBOBOX"),
-            &wide(""),
-            WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32) | WS_VSCROLL | WS_TABSTOP,
-            lm, y, cw, 260, ID_COMBO,
-        );
-        y += 42;
-
-        mk(w!("STATIC"), &wide("Имя-активатор (через запятую)"), WINDOW_STYLE(0), lm, y, cw, 18, 0);
-        y += 22;
-        let edit = mk(
-            w!("EDIT"),
-            &wide(&cfg.wake_words.join(", ")),
-            WINDOW_STYLE(ES_AUTOHSCROLL as u32) | WS_BORDER | WS_TABSTOP,
-            lm, y, cw, 26, ID_EDIT,
-        );
-        y += 42;
-
-        mk(w!("STATIC"), &wide("Стоп-слова (через запятую)"), WINDOW_STYLE(0), lm, y, cw, 18, 0);
-        y += 22;
-        let stop = mk(
-            w!("EDIT"),
-            &wide(&cfg.stop_words.join(", ")),
-            WINDOW_STYLE(ES_AUTOHSCROLL as u32) | WS_BORDER | WS_TABSTOP,
-            lm, y, cw, 26, ID_STOP,
-        );
-        y += 42;
-
-        mk(w!("STATIC"), &wide("Горячая клавиша (напр. ctrl+alt+j)"), WINDOW_STYLE(0), lm, y, cw, 18, 0);
-        y += 22;
-        let hotkey = mk(
-            w!("EDIT"),
-            &wide(&cfg.hotkey),
-            WINDOW_STYLE(ES_AUTOHSCROLL as u32) | WS_BORDER | WS_TABSTOP,
-            lm, y, cw, 26, ID_HOTKEY,
-        );
-        y += 42;
-
-        mk(w!("STATIC"), &wide("Показывать оверлей"), WINDOW_STYLE(0), lm, y, cw, 18, 0);
-        y += 22;
-        let mode = mk(
-            w!("COMBOBOX"),
-            &wide(""),
-            WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32) | WS_VSCROLL | WS_TABSTOP,
-            lm, y, cw, 140, ID_MODE,
-        );
-        y += 42;
-
-        let live = mk(
-            w!("BUTTON"),
-            &wide("Печатать сразу, по мере речи"),
-            WINDOW_STYLE(BS_AUTOCHECKBOX as u32) | WS_TABSTOP,
-            lm, y, cw, 24, ID_LIVE,
-        );
-        y += 42;
-
-        mk(
-            w!("BUTTON"),
-            &wide("Сохранить"),
-            WINDOW_STYLE(BS_DEFPUSHBUTTON as u32) | WS_TABSTOP,
-            lm, y, 130, 34, ID_SAVE,
-        );
-        mk(
-            w!("BUTTON"),
-            &wide("Отмена"),
-            WINDOW_STYLE(BS_PUSHBUTTON as u32) | WS_TABSTOP,
-            lm + 146, y, 130, 34, ID_CANCEL,
-        );
-
-        // список микрофонов
-        let devices = audio::list_input_devices();
-        SendMessageW(combo, CB_ADDSTRING, WPARAM(0), LPARAM(wide("По умолчанию").as_ptr() as isize));
-        let mut sel: usize = 0;
-        for (i, d) in devices.iter().enumerate() {
-            let wd = wide(d);
-            SendMessageW(combo, CB_ADDSTRING, WPARAM(0), LPARAM(wd.as_ptr() as isize));
-            if Some(d) == cfg.device_name.as_ref() {
-                sel = i + 1;
-            }
-        }
-        SendMessageW(combo, CB_SETCURSEL, WPARAM(sel), LPARAM(0));
-
-        // режимы показа оверлея (подписи явные, чтобы не путать)
-        for m in [
-            "Всегда (не прячется на стоп)",
-            "Только при диктовке (прячется в покое)",
-            "Скрыт",
-        ] {
-            SendMessageW(mode, CB_ADDSTRING, WPARAM(0), LPARAM(wide(m).as_ptr() as isize));
-        }
-        let mode_idx = match cfg.overlay_mode.as_str() {
-            "dictation" => 1,
-            "hidden" => 2,
-            _ => 0,
-        };
-        SendMessageW(mode, CB_SETCURSEL, WPARAM(mode_idx), LPARAM(0));
-
-        // чекбокс live-ввода
-        SendMessageW(live, BM_SETCHECK, WPARAM(if cfg.live_typing { 1 } else { 0 }), LPARAM(0));
-
-        UI.with_borrow_mut(|ui| {
-            ui.settings_hwnd = hwnd;
-            ui.settings_combo = combo;
-            ui.settings_edit = edit;
-            ui.settings_stop = stop;
-            ui.settings_hotkey = hotkey;
-            ui.settings_mode = mode;
-            ui.settings_live = live;
-            ui.settings_font = font;
-            ui.settings_devices = devices;
-        });
-
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = UpdateWindow(hwnd);
-
-        // вернуть прежний контекст DPI для потока
-        SetThreadDpiAwarenessContext(prev_dpi);
+/// Применить настройки из окна: сохранить конфиг и подхватить изменения
+/// (микрофон, хоткей, слова-команды) без перезапуска.
+pub fn apply(new: crate::config::Config) {
+    let (device_changed, hotkey_changed, words_changed, device_name, hotkey);
+    {
+        let mut cfg = shared().config.lock().unwrap();
+        device_changed = cfg.device_name != new.device_name;
+        hotkey_changed = cfg.hotkey != new.hotkey;
+        words_changed = cfg.wake_words != new.wake_words
+            || cfg.stop_words != new.stop_words
+            || cfg.hotwords_score != new.hotwords_score;
+        device_name = new.device_name.clone();
+        hotkey = new.hotkey.clone();
+        *cfg = new;
+        cfg.save();
     }
-}
 
-extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    unsafe {
-        match msg {
-            WM_COMMAND => {
-                let id = (wp.0 & 0xFFFF) as i32;
-                match id {
-                    ID_SAVE => {
-                        save_settings();
-                        DestroyWindow(hwnd).ok();
-                    }
-                    ID_CANCEL => {
-                        DestroyWindow(hwnd).ok();
-                    }
-                    _ => {}
-                }
-                LRESULT(0)
-            }
-            WM_CLOSE => {
-                DestroyWindow(hwnd).ok();
-                LRESULT(0)
-            }
-            WM_DESTROY => {
-                UI.with_borrow_mut(|ui| {
-                    if !ui.settings_font.0.is_null() {
-                        let _ = DeleteObject(ui.settings_font);
-                        ui.settings_font = HFONT::default();
-                    }
-                    ui.settings_hwnd = HWND::default();
-                });
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, wp, lp),
-        }
+    if device_changed {
+        rebuild_stream(device_name.as_deref());
     }
-}
-
-unsafe fn read_text(h: HWND) -> String {
-    let len = GetWindowTextLengthW(h);
-    let mut buf = vec![0u16; (len + 1) as usize];
-    let got = GetWindowTextW(h, &mut buf);
-    String::from_utf16_lossy(&buf[..got as usize])
-}
-
-unsafe fn read_words(h: HWND) -> Vec<String> {
-    read_text(h)
-        .split(',')
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect()
+    if hotkey_changed {
+        unsafe { reregister_hotkey(UI.with_borrow(|ui| ui.main), &hotkey) };
+    }
+    // при смене слов пересоздаём распознаватель (обновить hotwords-буст)
+    if words_changed {
+        crate::shared::send_worker(WorkerMsg::Reload);
+    } else {
+        crate::shared::send_worker(WorkerMsg::Reset);
+    }
 }
 
 unsafe fn reregister_hotkey(main: HWND, hk: &str) {
@@ -1194,72 +921,3 @@ unsafe fn reregister_hotkey(main: HWND, hk: &str) {
     }
 }
 
-fn save_settings() {
-    let (combo, edit, stop, hotkey_h, mode, live, devices, main) = UI.with_borrow(|ui| {
-        (
-            ui.settings_combo,
-            ui.settings_edit,
-            ui.settings_stop,
-            ui.settings_hotkey,
-            ui.settings_mode,
-            ui.settings_live,
-            ui.settings_devices.clone(),
-            ui.main,
-        )
-    });
-
-    unsafe {
-        let sel = SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-        let device_name = if sel <= 0 {
-            None
-        } else {
-            devices.get((sel - 1) as usize).cloned()
-        };
-        let wake_words = read_words(edit);
-        let stop_words = read_words(stop);
-        let hk = read_text(hotkey_h).trim().to_lowercase();
-        let mi = SendMessageW(mode, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-        let overlay_mode = match mi {
-            1 => "dictation",
-            2 => "hidden",
-            _ => "always",
-        }
-        .to_string();
-        let live_on = SendMessageW(live, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1;
-
-        let (device_changed, hotkey_changed, words_changed);
-        {
-            let mut cfg = shared().config.lock().unwrap();
-            device_changed = cfg.device_name != device_name;
-            hotkey_changed = !hk.is_empty() && cfg.hotkey != hk;
-            words_changed = (!wake_words.is_empty() && cfg.wake_words != wake_words)
-                || (!stop_words.is_empty() && cfg.stop_words != stop_words);
-            cfg.device_name = device_name.clone();
-            if !wake_words.is_empty() {
-                cfg.wake_words = wake_words;
-            }
-            if !stop_words.is_empty() {
-                cfg.stop_words = stop_words;
-            }
-            if !hk.is_empty() {
-                cfg.hotkey = hk.clone();
-            }
-            cfg.overlay_mode = overlay_mode;
-            cfg.live_typing = live_on;
-            cfg.save();
-        }
-
-        if device_changed {
-            rebuild_stream(device_name.as_deref());
-        }
-        if hotkey_changed {
-            reregister_hotkey(main, &hk);
-        }
-        // при смене слов пересоздаём распознаватель (обновить hotwords-буст)
-        if words_changed {
-            crate::shared::send_worker(WorkerMsg::Reload);
-        } else {
-            crate::shared::send_worker(WorkerMsg::Reset);
-        }
-    }
-}
