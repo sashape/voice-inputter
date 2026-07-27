@@ -56,6 +56,7 @@ pub enum Region {
 pub struct Frame<'a> {
     pub bars: &'a [f32], // высоты 0..1
     pub hovered: bool,
+    pub recording: bool, // идёт диктовка (квадрат-стоп) или покой (микрофон)
 }
 
 /// Размер окна оверлея в физических пикселях при данном масштабе.
@@ -138,8 +139,8 @@ pub fn render(buf: &mut [u8], f: &Frame, s: f32) {
     // рамка 2.5px accent-200 @ .7
     stroke_rrect(buf, w, h, PILL_X * s, PILL_Y * s, PILL_W * s, PILL_H * s, PILL_R * s, 2.5 * s, ACCENT_200, 0.70);
 
-    // микрофон-кнопка
-    draw_mic(buf, w, h, s);
+    // микрофон-кнопка (стоп-квадрат при записи, иконка микрофона в покое)
+    draw_mic(buf, w, h, s, f.recording);
 
     // бары
     for (i, &lv) in f.bars.iter().enumerate() {
@@ -161,29 +162,48 @@ pub fn render(buf: &mut [u8], f: &Frame, s: f32) {
     }
 }
 
-fn draw_mic(buf: &mut [u8], w: i32, h: i32, s: f32) {
+fn draw_mic(buf: &mut [u8], w: i32, h: i32, s: f32, recording: bool) {
     let (mcx, mcy, mr) = (MIC_CX * s, MIC_CY * s, MIC_R * s);
-    // фон круга — радиальный фиолетовый
-    fill_circle_fn(buf, w, h, mcx, mcy, mr, 1.0, |px, py| {
-        let d = dist(px, py, mcx, mcy) / mr; // 0 центр .. 1 край
-        (ACCENT_500, lerp_f(0.42, 0.14, d.clamp(0.0, 1.0)))
-    });
-    // рамка accent-400
-    stroke_circle(buf, w, h, mcx, mcy, mr, 1.4 * s, ACCENT_400, 0.9);
-    // квадрат-стоп accent-200 (свечение внутри круга — не выходит за пилюлю)
-    draw_glow(buf, w, h, (mcx, mcy), (STOP_HALF + 6.0) * s, STOP_HALF * s, ACCENT_200, 0.5);
-    fill_rrect(
-        buf,
-        w,
-        h,
-        mcx - STOP_HALF * s,
-        mcy - STOP_HALF * s,
-        STOP_HALF * 2.0 * s,
-        STOP_HALF * 2.0 * s,
-        5.0 * s,
-        1.0,
-        |_, _| ACCENT_200,
+    if recording {
+        // подсвеченный круг + квадрат-стоп
+        fill_circle_fn(buf, w, h, mcx, mcy, mr, 1.0, |px, py| {
+            let d = dist(px, py, mcx, mcy) / mr;
+            (ACCENT_500, lerp_f(0.42, 0.14, d.clamp(0.0, 1.0)))
+        });
+        stroke_circle(buf, w, h, mcx, mcy, mr, 1.4 * s, ACCENT_400, 0.9);
+        draw_glow(buf, w, h, (mcx, mcy), (STOP_HALF + 6.0) * s, STOP_HALF * s, ACCENT_200, 0.5);
+        fill_rrect(
+            buf, w, h,
+            mcx - STOP_HALF * s, mcy - STOP_HALF * s,
+            STOP_HALF * 2.0 * s, STOP_HALF * 2.0 * s,
+            5.0 * s, 1.0, |_, _| ACCENT_200,
+        );
+    } else {
+        // приглушённый круг + иконка микрофона (состояние «стоп»)
+        fill_circle_fn(buf, w, h, mcx, mcy, mr, 1.0, |px, py| {
+            let d = dist(px, py, mcx, mcy) / mr;
+            (ACCENT_500, lerp_f(0.18, 0.04, d.clamp(0.0, 1.0)))
+        });
+        stroke_circle(buf, w, h, mcx, mcy, mr, 1.2 * s, ACCENT_300, 0.55);
+        draw_mic_glyph(buf, w, h, mcx, mcy, s);
+    }
+}
+
+/// Иконка микрофона (тело-капсула + U-держатель + ножка + основание).
+fn draw_mic_glyph(buf: &mut [u8], w: i32, h: i32, mcx: f32, mcy: f32, s: f32) {
+    let col = ACCENT_200;
+    let a = 0.95;
+    // тело-капсула
+    fill_rrect(buf, w, h, mcx - 4.5 * s, mcy - 11.0 * s, 9.0 * s, 14.0 * s, 4.5 * s, a, |_, _| col);
+    // U-держатель (нижняя дуга)
+    stroke_arc(
+        buf, w, h, mcx, mcy - 2.5 * s, 7.5 * s,
+        0.45, std::f32::consts::PI - 0.45, 1.8 * s, col, a,
     );
+    // ножка
+    seg(buf, w, h, mcx, mcy + 5.0 * s, mcx, mcy + 13.0 * s, 1.8 * s, col, a);
+    // основание
+    seg(buf, w, h, mcx - 6.0 * s, mcy + 13.0 * s, mcx + 6.0 * s, mcy + 13.0 * s, 1.8 * s, col, a);
 }
 
 fn draw_ctrl_button(buf: &mut [u8], w: i32, h: i32, cx: f32, s: f32) {
@@ -364,6 +384,42 @@ fn stroke_circle(buf: &mut [u8], w: i32, h: i32, cx: f32, cy: f32, r: f32, bw: f
     }
 }
 
+/// Дуга окружности: обводка только там, где угол atan2 ∈ [a0, a1].
+#[allow(clippy::too_many_arguments)]
+fn stroke_arc(
+    buf: &mut [u8],
+    w: i32,
+    h: i32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    a0: f32,
+    a1: f32,
+    bw: f32,
+    c: Rgb,
+    alpha: f32,
+) {
+    let x_min = (cx - r - bw).floor() as i32;
+    let x_max = (cx + r + bw).ceil() as i32;
+    let y_min = (cy - r - bw).floor() as i32;
+    let y_max = (cy + r + bw).ceil() as i32;
+    for y in y_min..y_max {
+        for x in x_min..x_max {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let ang = (py - cy).atan2(px - cx);
+            if ang < a0 || ang > a1 {
+                continue;
+            }
+            let d = (dist(px, py, cx, cy) - r).abs() - bw / 2.0;
+            let cov = (0.5 - d).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                put(buf, w, h, x, y, c, cov * alpha);
+            }
+        }
+    }
+}
+
 fn seg(buf: &mut [u8], w: i32, h: i32, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Rgb, alpha: f32) {
     let x_min = (x0.min(x1) - width).floor() as i32;
     let x_max = (x0.max(x1) + width).ceil() as i32;
@@ -484,9 +540,16 @@ mod tests {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(1.0);
+        let rec = std::env::var("PREVIEW_REC").map(|v| v != "0").unwrap_or(true);
+        if !rec {
+            // покой — низкие спокойные бары
+            for _ in 0..40 {
+                animate(&mut bars, 0.05, 2.1);
+            }
+        }
         let (w, h) = dims(scale);
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        render(&mut buf, &Frame { bars: &bars, hovered: true }, scale);
+        render(&mut buf, &Frame { bars: &bars, hovered: true, recording: rec }, scale);
 
         // композит поверх тёмного фона (имитация рабочего стола)
         let bg = (26u8, 28u8, 38u8);
@@ -499,7 +562,7 @@ mod tests {
                 rgb[p * 3 + k] = (s * a + b * (1.0 - a)) as u8;
             }
         }
-        let out = std::env::temp_dir().join(format!("voice_inputter_render_{scale}.bmp"));
+        let out = std::env::temp_dir().join(format!("voice_inputter_render_{scale}_{rec}.bmp"));
         write_bmp(out.to_str().unwrap(), w, h, &rgb);
         println!("wrote {}", out.display());
     }
