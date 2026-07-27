@@ -1,0 +1,12 @@
+/target
+/models
+/dist
+*.dll
+config.json
+run_*.txt
+
+# stray test-run redirects
+e*.txt
+o*.txt
+c*.txt
+debug_trace.txt
