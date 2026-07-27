@@ -10,3 +10,5 @@ e*.txt
 o*.txt
 c*.txt
 debug_trace.txt
+/preview
+*.html
