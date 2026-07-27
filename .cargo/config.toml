@@ -1,0 +1,4 @@
+# sherpa-onnx линкуется статически с MT (статический CRT). Чтобы не было
+# конфликта двух CRT, собираем и наш exe со статическим CRT.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
