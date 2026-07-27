@@ -704,6 +704,7 @@ fn draw_overlay(ui: &Ui) {
         &overlay::Frame {
             bars: &ui.bars,
             hovered: hover_active(ui),
+            recording: is_dictating(),
         },
         scale,
     );
