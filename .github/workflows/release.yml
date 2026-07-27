@@ -1,0 +1,56 @@
+name: release
+
+# При пуше тега v* — собираем exe, пакуем zip с моделью и кладём в GitHub Release.
+# workflow_dispatch — ручной запуск для проверки сборки (без релиза).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  MODEL: sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16
+
+jobs:
+  build:
+    runs-on: windows-latest # здесь уже есть MSVC + Rust msvc-тулчейн
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build exe
+        run: cargo build --release
+
+      - name: Download model
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force models | Out-Null
+          $url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$env:MODEL.tar.bz2"
+          Invoke-WebRequest $url -OutFile model.tar.bz2
+          tar -xf model.tar.bz2 -C models
+
+      - name: Package dist (exe + model + config)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist, dist/models | Out-Null
+          Copy-Item target/release/voice-inputter.exe dist/
+          Copy-Item config.example.json dist/config.json
+          Copy-Item -Recurse "models/$env:MODEL" "dist/models/$env:MODEL"
+          Compress-Archive -Path dist/* -DestinationPath VoiceInputter-win-x64.zip -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceInputter-win-x64
+          path: VoiceInputter-win-x64.zip
+
+      - name: Publish release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: >
+          gh release create ${{ github.ref_name }}
+          VoiceInputter-win-x64.zip
+          target/release/voice-inputter.exe
+          --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
