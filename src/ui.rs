@@ -88,6 +88,9 @@ struct Ui {
     hovered: bool,
     hover_leave_at: Option<Instant>,
     tracking_leave: bool,
+    last_dictating: bool,
+    dict_ended_at: Option<Instant>,
+    dismissed: bool,
     icons: [HICON; 3],
     stream: Option<cpal::Stream>,
     settings_combo: HWND,
@@ -114,6 +117,9 @@ impl Default for Ui {
             hovered: false,
             hover_leave_at: None,
             tracking_leave: false,
+            last_dictating: false,
+            dict_ended_at: None,
+            dismissed: false,
             icons: [HICON::default(); 3],
             stream: None,
             settings_combo: HWND::default(),
@@ -485,6 +491,8 @@ fn show_tray_menu(hwnd: HWND) {
 
 // ── оверлей: волна ───────────────────────────────────────────────────────
 const HOVER_GRACE: std::time::Duration = std::time::Duration::from_millis(450);
+/// Сколько показывать idle-состояние после стопа в режиме «Только при диктовке».
+const OVERLAY_LINGER: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Активен ли ховер (наведение или ещё в grace-периоде после ухода).
 fn hover_active(ui: &Ui) -> bool {
@@ -549,6 +557,9 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     Region::Close => {
                         if is_dictating() {
                             crate::shared::send_worker(WorkerMsg::Toggle);
+                        } else {
+                            // в покое ✕ прячет пилюлю (в режиме «Только при диктовке»)
+                            UI.with_borrow_mut(|ui| ui.dismissed = true);
                         }
                     }
                     Region::Gear => open_settings(),
@@ -620,14 +631,30 @@ fn tick_overlay() {
         let cfg = shared().config.lock().unwrap();
         (cfg.overlay_mode.clone(), is_enabled())
     };
-    // Режим показа: во время диктовки прячем только если оверлей вовсе скрыт.
-    let should_show = match mode.as_str() {
-        "hidden" => false,
-        "always" => enabled,
-        _ => dictating, // "dictation"
-    };
 
     UI.with_borrow_mut(|ui| {
+        // отслеживаем момент остановки диктовки (для «линжера» в режиме dictation)
+        if dictating != ui.last_dictating {
+            if dictating {
+                ui.dismissed = false; // новая диктовка снимает «скрыто»
+                ui.dict_ended_at = None;
+            } else {
+                ui.dict_ended_at = Some(Instant::now());
+            }
+            ui.last_dictating = dictating;
+        }
+        let lingering = ui
+            .dict_ended_at
+            .map(|t| t.elapsed() < OVERLAY_LINGER)
+            .unwrap_or(false);
+
+        let should_show = match mode.as_str() {
+            "hidden" => false,
+            "always" => enabled,
+            // dictation: диктовка + линжер idle-состояния + пока наведён курсор
+            _ => dictating || (!ui.dismissed && (lingering || hover_active(ui))),
+        };
+
         let visible = unsafe { IsWindowVisible(ui.overlay_hwnd).as_bool() };
         if should_show {
             if !visible {
