@@ -687,10 +687,9 @@ fn tick_overlay() {
                 .unwrap_or(0.0);
             // при диктовке — реальный уровень; в покое (idle) — приглушённый
             let raw = current_level() as f32 / 1000.0;
-            let level = if dictating { raw } else { raw * 0.35 };
-            ui.level_smooth += (level - ui.level_smooth) * 0.25;
+            ui.level_smooth += (raw - ui.level_smooth) * 0.25;
             let lvl = ui.level_smooth;
-            overlay::animate(&mut ui.bars, lvl, t);
+            overlay::animate(&mut ui.bars, lvl, t, dictating);
             draw_overlay(ui);
         } else if visible {
             ui.hovered = false;
@@ -726,12 +725,14 @@ fn draw_overlay(ui: &Ui) {
     let (w, h) = (dw as usize, dh as usize);
     // straight-alpha RGBA буфер — рисуем по макету в отдельном модуле
     let mut buf = vec![0u8; w * h * 4];
+    let t = ui.anim_start.map(|s| s.elapsed().as_secs_f32()).unwrap_or(0.0);
     overlay::render(
         &mut buf,
         &overlay::Frame {
             bars: &ui.bars,
             hovered: hover_active(ui),
             recording: is_dictating(),
+            t,
         },
         scale,
     );
