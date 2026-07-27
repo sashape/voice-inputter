@@ -23,8 +23,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-    SelectObject, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
+    CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject,
+    GetDC, ReleaseDC, SelectObject, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, HBITMAP, HDC, HFONT, LOGFONTW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -58,6 +59,10 @@ const ID_COMBO: i32 = 101;
 const ID_EDIT: i32 = 102;
 const ID_SAVE: i32 = 103;
 const ID_CANCEL: i32 = 104;
+const ID_STOP: i32 = 105;
+const ID_HOTKEY: i32 = 106;
+const ID_MODE: i32 = 107;
+const ID_LIVE: i32 = 108;
 
 use overlay::{OV_H, OV_W};
 
@@ -81,11 +86,17 @@ struct Ui {
     level_smooth: f32,
     anim_start: Option<Instant>,
     hovered: bool,
+    hover_leave_at: Option<Instant>,
     tracking_leave: bool,
     icons: [HICON; 3],
     stream: Option<cpal::Stream>,
     settings_combo: HWND,
     settings_edit: HWND,
+    settings_stop: HWND,
+    settings_hotkey: HWND,
+    settings_mode: HWND,
+    settings_live: HWND,
+    settings_font: HFONT,
     settings_devices: Vec<String>,
 }
 
@@ -101,11 +112,17 @@ impl Default for Ui {
             level_smooth: 0.0,
             anim_start: None,
             hovered: false,
+            hover_leave_at: None,
             tracking_leave: false,
             icons: [HICON::default(); 3],
             stream: None,
             settings_combo: HWND::default(),
             settings_edit: HWND::default(),
+            settings_stop: HWND::default(),
+            settings_hotkey: HWND::default(),
+            settings_mode: HWND::default(),
+            settings_live: HWND::default(),
+            settings_font: HFONT::default(),
             settings_devices: Vec::new(),
         }
     }
@@ -467,19 +484,29 @@ fn show_tray_menu(hwnd: HWND) {
 }
 
 // ── оверлей: волна ───────────────────────────────────────────────────────
+const HOVER_GRACE: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// Активен ли ховер (наведение или ещё в grace-периоде после ухода).
+fn hover_active(ui: &Ui) -> bool {
+    ui.hovered
+        || ui
+            .hover_leave_at
+            .map(|t| t.elapsed() < HOVER_GRACE)
+            .unwrap_or(false)
+}
+
 extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_NCHITTEST => {
-                // экранные координаты → локальные
                 let sx = (lp.0 & 0xFFFF) as i16 as i32;
                 let sy = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rc);
-                let (hovered, scale) =
-                    UI.with_borrow(|ui| (ui.hovered, ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0)));
-                let region = overlay::hit_test(sx - rc.left, sy - rc.top, hovered, scale);
-                // None → сквозной клик; иначе окно ловит мышь (но не активируется)
+                let (active, scale) = UI.with_borrow(|ui| {
+                    (hover_active(ui), ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0))
+                });
+                let region = overlay::hit_test(sx - rc.left, sy - rc.top, active, scale);
                 if region == Region::None {
                     LRESULT(HTTRANSPARENT as isize)
                 } else {
@@ -489,6 +516,7 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_MOUSEMOVE => {
                 UI.with_borrow_mut(|ui| {
                     ui.hovered = true;
+                    ui.hover_leave_at = None;
                     if !ui.tracking_leave {
                         let mut tme = TRACKMOUSEEVENT {
                             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -505,6 +533,7 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_MOUSELEAVE => {
                 UI.with_borrow_mut(|ui| {
                     ui.hovered = false;
+                    ui.hover_leave_at = Some(Instant::now());
                     ui.tracking_leave = false;
                 });
                 LRESULT(0)
@@ -512,11 +541,15 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_LBUTTONUP => {
                 let x = (lp.0 & 0xFFFF) as i16 as i32;
                 let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
-                let (hovered, scale) =
-                    UI.with_borrow(|ui| (ui.hovered, ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0)));
-                match overlay::hit_test(x, y, hovered, scale) {
-                    Region::Mic | Region::Close => {
-                        crate::shared::send_worker(WorkerMsg::Toggle)
+                let (active, scale) = UI.with_borrow(|ui| {
+                    (hover_active(ui), ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0))
+                });
+                match overlay::hit_test(x, y, active, scale) {
+                    Region::Mic => crate::shared::send_worker(WorkerMsg::Toggle),
+                    Region::Close => {
+                        if is_dictating() {
+                            crate::shared::send_worker(WorkerMsg::Toggle);
+                        }
                     }
                     Region::Gear => open_settings(),
                     _ => {}
@@ -583,12 +616,22 @@ fn workarea() -> RECT {
 
 fn tick_overlay() {
     let dictating = is_dictating();
+    let (mode, enabled) = {
+        let cfg = shared().config.lock().unwrap();
+        (cfg.overlay_mode.clone(), is_enabled())
+    };
+    // Режим показа: во время диктовки прячем только если оверлей вовсе скрыт.
+    let should_show = match mode.as_str() {
+        "hidden" => false,
+        "always" => enabled,
+        _ => dictating, // "dictation"
+    };
+
     UI.with_borrow_mut(|ui| {
         let visible = unsafe { IsWindowVisible(ui.overlay_hwnd).as_bool() };
-        if dictating {
+        if should_show {
             if !visible {
-                // масштаб мог измениться (DPI/конфиг) — при необходимости
-                // пересоздаём DIB под новый размер
+                // масштаб мог измениться (DPI/конфиг) — пересоздаём DIB
                 let want = overlay_scale_for(ui.overlay_hwnd);
                 let cur = ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0);
                 if (want - cur).abs() > 0.01 {
@@ -596,7 +639,6 @@ fn tick_overlay() {
                 }
                 let scale = ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0);
                 let (ovw, ovh) = overlay::dims(scale);
-                // спозиционировать по центру снизу и показать без активации
                 let wa = workarea();
                 let x = wa.left + (wa.right - wa.left - ovw) / 2;
                 let y = wa.bottom - ovh - (24.0 * scale) as i32;
@@ -612,18 +654,20 @@ fn tick_overlay() {
                     let _ = ShowWindow(ui.overlay_hwnd, SW_SHOWNOACTIVATE);
                 }
             }
-            // анимация баров: реальный уровень + фаза времени
             let t = ui
                 .anim_start
                 .map(|s| s.elapsed().as_secs_f32())
                 .unwrap_or(0.0);
-            let level = current_level() as f32 / 1000.0;
+            // при диктовке — реальный уровень; в покое (idle) — приглушённый
+            let raw = current_level() as f32 / 1000.0;
+            let level = if dictating { raw } else { raw * 0.35 };
             ui.level_smooth += (level - ui.level_smooth) * 0.25;
             let lvl = ui.level_smooth;
             overlay::animate(&mut ui.bars, lvl, t);
             draw_overlay(ui);
         } else if visible {
             ui.hovered = false;
+            ui.hover_leave_at = None;
             ui.tracking_leave = false;
             unsafe {
                 let _ = ShowWindow(ui.overlay_hwnd, SW_HIDE);
@@ -659,7 +703,7 @@ fn draw_overlay(ui: &Ui) {
         &mut buf,
         &overlay::Frame {
             bars: &ui.bars,
-            hovered: ui.hovered,
+            hovered: hover_active(ui),
         },
         scale,
     );
@@ -778,6 +822,22 @@ fn make_icon(color: (u8, u8, u8), size: i32) -> HICON {
 }
 
 // ── окно настроек ────────────────────────────────────────────────────────
+fn make_ui_font() -> HFONT {
+    unsafe {
+        let mut lf = LOGFONTW {
+            lfHeight: -15, // ~11pt при 96 DPI
+            lfWeight: 400, // обычный
+            lfCharSet: DEFAULT_CHARSET,
+            lfQuality: CLEARTYPE_QUALITY,
+            ..Default::default()
+        };
+        for (i, c) in "Segoe UI".encode_utf16().enumerate().take(31) {
+            lf.lfFaceName[i] = c;
+        }
+        CreateFontIndirectW(&lf)
+    }
+}
+
 fn open_settings() {
     UI.with_borrow(|ui| {
         if !ui.settings_hwnd.0.is_null() {
@@ -802,8 +862,8 @@ fn open_settings() {
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            400,
-            240,
+            456,
+            474,
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -811,11 +871,12 @@ fn open_settings() {
         )
         .expect("settings window");
 
-        let font = windows::Win32::Graphics::Gdi::GetStockObject(
-            windows::Win32::Graphics::Gdi::DEFAULT_GUI_FONT,
-        );
+        let font = make_ui_font();
+        let cfg = shared().config.lock().unwrap().clone();
+        let lm = 20i32; // левый отступ
+        let cw = 412i32; // ширина контролов
 
-        let mk = |class: PCWSTR, text: &Vec<u16>, style: WINDOW_STYLE, x, y, w_, h_, id: i32| {
+        let mk = |class: PCWSTR, text: &Vec<u16>, style: WINDOW_STYLE, x, y, w_, h_, id: i32| -> HWND {
             let c = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 class,
@@ -831,109 +892,118 @@ fn open_settings() {
                 None,
             )
             .unwrap();
-            SendMessageW(
-                c,
-                WM_SETFONT,
-                WPARAM(font.0 as usize),
-                LPARAM(1),
-            );
+            SendMessageW(c, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
             c
         };
 
-        let empty = wide("");
-        mk(
-            w!("STATIC"),
-            &wide("Микрофон:"),
-            WINDOW_STYLE(0),
-            16,
-            14,
-            360,
-            18,
-            0,
-        );
+        let mut y = 16i32;
+        mk(w!("STATIC"), &wide("Микрофон"), WINDOW_STYLE(0), lm, y, cw, 18, 0);
+        y += 22;
         let combo = mk(
             w!("COMBOBOX"),
-            &empty,
+            &wide(""),
             WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32) | WS_VSCROLL | WS_TABSTOP,
-            16,
-            34,
-            360,
-            200,
-            ID_COMBO,
+            lm, y, cw, 260, ID_COMBO,
         );
-        mk(
-            w!("STATIC"),
-            &wide("Имя-активатор (через запятую):"),
-            WINDOW_STYLE(0),
-            16,
-            78,
-            360,
-            18,
-            0,
-        );
+        y += 42;
 
-        let cfg = shared().config.lock().unwrap().clone();
-        let wake_text = wide(&cfg.wake_words.join(", "));
+        mk(w!("STATIC"), &wide("Имя-активатор (через запятую)"), WINDOW_STYLE(0), lm, y, cw, 18, 0);
+        y += 22;
         let edit = mk(
             w!("EDIT"),
-            &wake_text,
-            WINDOW_STYLE((ES_AUTOHSCROLL) as u32) | WS_BORDER | WS_TABSTOP,
-            16,
-            98,
-            360,
-            26,
-            ID_EDIT,
+            &wide(&cfg.wake_words.join(", ")),
+            WINDOW_STYLE(ES_AUTOHSCROLL as u32) | WS_BORDER | WS_TABSTOP,
+            lm, y, cw, 26, ID_EDIT,
         );
+        y += 42;
+
+        mk(w!("STATIC"), &wide("Стоп-слова (через запятую)"), WINDOW_STYLE(0), lm, y, cw, 18, 0);
+        y += 22;
+        let stop = mk(
+            w!("EDIT"),
+            &wide(&cfg.stop_words.join(", ")),
+            WINDOW_STYLE(ES_AUTOHSCROLL as u32) | WS_BORDER | WS_TABSTOP,
+            lm, y, cw, 26, ID_STOP,
+        );
+        y += 42;
+
+        mk(w!("STATIC"), &wide("Горячая клавиша (напр. ctrl+alt+j)"), WINDOW_STYLE(0), lm, y, cw, 18, 0);
+        y += 22;
+        let hotkey = mk(
+            w!("EDIT"),
+            &wide(&cfg.hotkey),
+            WINDOW_STYLE(ES_AUTOHSCROLL as u32) | WS_BORDER | WS_TABSTOP,
+            lm, y, cw, 26, ID_HOTKEY,
+        );
+        y += 42;
+
+        mk(w!("STATIC"), &wide("Показывать оверлей"), WINDOW_STYLE(0), lm, y, cw, 18, 0);
+        y += 22;
+        let mode = mk(
+            w!("COMBOBOX"),
+            &wide(""),
+            WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32) | WS_VSCROLL | WS_TABSTOP,
+            lm, y, cw, 140, ID_MODE,
+        );
+        y += 42;
+
+        let live = mk(
+            w!("BUTTON"),
+            &wide("Печатать сразу, по мере речи"),
+            WINDOW_STYLE(BS_AUTOCHECKBOX as u32) | WS_TABSTOP,
+            lm, y, cw, 24, ID_LIVE,
+        );
+        y += 42;
 
         mk(
             w!("BUTTON"),
             &wide("Сохранить"),
             WINDOW_STYLE(BS_DEFPUSHBUTTON as u32) | WS_TABSTOP,
-            16,
-            150,
-            120,
-            32,
-            ID_SAVE,
+            lm, y, 130, 34, ID_SAVE,
         );
         mk(
             w!("BUTTON"),
             &wide("Отмена"),
             WINDOW_STYLE(BS_PUSHBUTTON as u32) | WS_TABSTOP,
-            150,
-            150,
-            120,
-            32,
-            ID_CANCEL,
+            lm + 146, y, 130, 34, ID_CANCEL,
         );
 
-        // заполнить список устройств
+        // список микрофонов
         let devices = audio::list_input_devices();
-        let def = wide("По умолчанию");
-        SendMessageW(
-            combo,
-            CB_ADDSTRING,
-            WPARAM(0),
-            LPARAM(def.as_ptr() as isize),
-        );
+        SendMessageW(combo, CB_ADDSTRING, WPARAM(0), LPARAM(wide("По умолчанию").as_ptr() as isize));
         let mut sel: usize = 0;
         for (i, d) in devices.iter().enumerate() {
             let wd = wide(d);
-            SendMessageW(
-                combo,
-                CB_ADDSTRING,
-                WPARAM(0),
-                LPARAM(wd.as_ptr() as isize),
-            );
+            SendMessageW(combo, CB_ADDSTRING, WPARAM(0), LPARAM(wd.as_ptr() as isize));
             if Some(d) == cfg.device_name.as_ref() {
                 sel = i + 1;
             }
         }
         SendMessageW(combo, CB_SETCURSEL, WPARAM(sel), LPARAM(0));
 
+        // режимы показа оверлея
+        for m in ["Всегда", "Только при диктовке", "Скрыт"] {
+            SendMessageW(mode, CB_ADDSTRING, WPARAM(0), LPARAM(wide(m).as_ptr() as isize));
+        }
+        let mode_idx = match cfg.overlay_mode.as_str() {
+            "dictation" => 1,
+            "hidden" => 2,
+            _ => 0,
+        };
+        SendMessageW(mode, CB_SETCURSEL, WPARAM(mode_idx), LPARAM(0));
+
+        // чекбокс live-ввода
+        SendMessageW(live, BM_SETCHECK, WPARAM(if cfg.live_typing { 1 } else { 0 }), LPARAM(0));
+
         UI.with_borrow_mut(|ui| {
             ui.settings_hwnd = hwnd;
             ui.settings_combo = combo;
             ui.settings_edit = edit;
+            ui.settings_stop = stop;
+            ui.settings_hotkey = hotkey;
+            ui.settings_mode = mode;
+            ui.settings_live = live;
+            ui.settings_font = font;
             ui.settings_devices = devices;
         });
 
@@ -967,7 +1037,13 @@ extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 LRESULT(0)
             }
             WM_DESTROY => {
-                UI.with_borrow_mut(|ui| ui.settings_hwnd = HWND::default());
+                UI.with_borrow_mut(|ui| {
+                    if !ui.settings_font.0.is_null() {
+                        let _ = DeleteObject(ui.settings_font);
+                        ui.settings_font = HFONT::default();
+                    }
+                    ui.settings_hwnd = HWND::default();
+                });
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -975,44 +1051,94 @@ extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     }
 }
 
+unsafe fn read_text(h: HWND) -> String {
+    let len = GetWindowTextLengthW(h);
+    let mut buf = vec![0u16; (len + 1) as usize];
+    let got = GetWindowTextW(h, &mut buf);
+    String::from_utf16_lossy(&buf[..got as usize])
+}
+
+unsafe fn read_words(h: HWND) -> Vec<String> {
+    read_text(h)
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+unsafe fn reregister_hotkey(main: HWND, hk: &str) {
+    let _ = UnregisterHotKey(main, HOTKEY_ID);
+    if let Some((mods, vk)) = crate::config::parse_hotkey(hk) {
+        let _ = RegisterHotKey(main, HOTKEY_ID, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk);
+    }
+}
+
 fn save_settings() {
-    let (combo, edit, devices) =
-        UI.with_borrow(|ui| (ui.settings_combo, ui.settings_edit, ui.settings_devices.clone()));
+    let (combo, edit, stop, hotkey_h, mode, live, devices, main) = UI.with_borrow(|ui| {
+        (
+            ui.settings_combo,
+            ui.settings_edit,
+            ui.settings_stop,
+            ui.settings_hotkey,
+            ui.settings_mode,
+            ui.settings_live,
+            ui.settings_devices.clone(),
+            ui.main,
+        )
+    });
 
     unsafe {
-        // микрофон
         let sel = SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
         let device_name = if sel <= 0 {
             None
         } else {
             devices.get((sel - 1) as usize).cloned()
         };
+        let wake_words = read_words(edit);
+        let stop_words = read_words(stop);
+        let hk = read_text(hotkey_h).trim().to_lowercase();
+        let mi = SendMessageW(mode, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+        let overlay_mode = match mi {
+            1 => "dictation",
+            2 => "hidden",
+            _ => "always",
+        }
+        .to_string();
+        let live_on = SendMessageW(live, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1;
 
-        // имя-активатор
-        let len = GetWindowTextLengthW(edit);
-        let mut buf = vec![0u16; (len + 1) as usize];
-        let got = GetWindowTextW(edit, &mut buf);
-        let text = String::from_utf16_lossy(&buf[..got as usize]);
-        let wake_words: Vec<String> = text
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let device_changed;
+        let (device_changed, hotkey_changed, words_changed);
         {
             let mut cfg = shared().config.lock().unwrap();
             device_changed = cfg.device_name != device_name;
+            hotkey_changed = !hk.is_empty() && cfg.hotkey != hk;
+            words_changed = (!wake_words.is_empty() && cfg.wake_words != wake_words)
+                || (!stop_words.is_empty() && cfg.stop_words != stop_words);
             cfg.device_name = device_name.clone();
             if !wake_words.is_empty() {
                 cfg.wake_words = wake_words;
             }
+            if !stop_words.is_empty() {
+                cfg.stop_words = stop_words;
+            }
+            if !hk.is_empty() {
+                cfg.hotkey = hk.clone();
+            }
+            cfg.overlay_mode = overlay_mode;
+            cfg.live_typing = live_on;
             cfg.save();
         }
 
         if device_changed {
             rebuild_stream(device_name.as_deref());
         }
-        crate::shared::send_worker(WorkerMsg::Reset);
+        if hotkey_changed {
+            reregister_hotkey(main, &hk);
+        }
+        // при смене слов пересоздаём распознаватель (обновить hotwords-буст)
+        if words_changed {
+            crate::shared::send_worker(WorkerMsg::Reload);
+        } else {
+            crate::shared::send_worker(WorkerMsg::Reset);
+        }
     }
 }

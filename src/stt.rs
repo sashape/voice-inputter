@@ -15,7 +15,16 @@ pub struct Recognizer {
 impl Recognizer {
     /// Создаёт распознаватель из папки модели (encoder/decoder/joiner + tokens
     /// определяются автоматически; предпочитаются int8-варианты).
-    pub fn new(model_dir: &str, sample_rate: i32) -> Result<Self, String> {
+    ///
+    /// `hotwords` (wake/stop-слова) с `hotwords_score` > 0 включают контекстное
+    /// усиление (modified_beam_search) — сильно повышает распознавание редких/
+    /// англоязычных активаторов вроде «джарвис».
+    pub fn new(
+        model_dir: &str,
+        sample_rate: i32,
+        hotwords: &[String],
+        hotwords_score: f32,
+    ) -> Result<Self, String> {
         let dir = Path::new(model_dir);
         if !dir.is_dir() {
             return Err(format!("Папка модели не найдена: {model_dir}"));
@@ -36,7 +45,23 @@ impl Recognizer {
         cfg.model_config.transducer.joiner = Some(joiner);
         cfg.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
         cfg.model_config.num_threads = 1;
-        cfg.decoding_method = Some("greedy_search".into());
+
+        // hotwords требуют modified_beam_search; иначе — быстрый greedy
+        let hw: Vec<String> = hotwords
+            .iter()
+            .map(|w| w.trim().to_lowercase())
+            .filter(|w| !w.is_empty())
+            .collect();
+        if hotwords_score > 0.0 && !hw.is_empty() {
+            cfg.decoding_method = Some("modified_beam_search".into());
+            cfg.max_active_paths = 4;
+            let buf = format!("{}\n", hw.join("\n")).into_bytes();
+            cfg.hotwords_buf = Some(buf);
+            cfg.hotwords_score = hotwords_score;
+        } else {
+            cfg.decoding_method = Some("greedy_search".into());
+        }
+
         // Детекция конца фразы (в Rust-обёртке дефолты нулевые — задаём сами).
         cfg.enable_endpoint = true;
         cfg.rule1_min_trailing_silence = 2.4; // тишина при пустой гипотезе
@@ -117,7 +142,7 @@ mod tests {
     #[ignore]
     fn transcribe_sample() {
         let base = "models/sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16";
-        let rec = Recognizer::new(base, 16000).expect("recognizer");
+        let rec = Recognizer::new(base, 16000, &[], 0.0).expect("recognizer");
         let wav = format!("{base}/test_wavs/0.wav");
         let wave = Wave::read(&wav).expect("read wav");
         rec.stream.accept_waveform(wave.sample_rate(), wave.samples());
