@@ -83,28 +83,27 @@ pub fn animate(bars: &mut [f32], level: f32, t: f32) {
 }
 
 // ── hit-test (физические координаты окна; s — масштаб) ────────────────────
-pub fn hit_test(x: i32, y: i32, hovered: bool, s: f32) -> Region {
-    // переводим в логические единицы и сравниваем с базовой раскладкой
+/// `active` — идёт ли взаимодействие (наведение + grace). Пока active, ВСЁ окно
+/// ловит мышь, поэтому переход курсора к контролам не теряет ховер.
+pub fn hit_test(x: i32, y: i32, active: bool, s: f32) -> Region {
     let px = (x as f32 + 0.5) / s;
     let py = (y as f32 + 0.5) / s;
     if dist(px, py, MIC_CX, MIC_CY) <= MIC_R {
         return Region::Mic;
     }
-    if hovered {
+    if active {
         if dist(px, py, GEAR_CX, CTRL_CY) <= CTRL_R {
             return Region::Gear;
         }
         if dist(px, py, CLOSE_CX, CTRL_CY) <= CTRL_R {
             return Region::Close;
         }
+        // всё окно интерактивно, пока активны — курсор не «выпадает» в дырах
+        return Region::Pill;
     }
     if sd_rrect(px - (PILL_X + PILL_W / 2.0), py - PILL_CY, PILL_W / 2.0, PILL_H / 2.0, PILL_R)
         <= 0.0
     {
-        return Region::Pill;
-    }
-    // «коридор» между пилюлей и контролами, чтобы курсор не терял hover
-    if hovered && (150.0..=230.0).contains(&px) && (14.0..=PILL_Y).contains(&py) {
         return Region::Pill;
     }
     Region::None

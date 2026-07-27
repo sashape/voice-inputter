@@ -55,14 +55,21 @@ impl Live {
     }
 }
 
+/// Собирает распознаватель из текущего конфига (модель + hotwords-буст).
+fn build_recognizer() -> Result<Recognizer, String> {
+    let cfg = shared().config.lock().unwrap().clone();
+    let model_path = resolve_resource(&cfg.model_path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| cfg.model_path.clone());
+    let mut hot = cfg.wake_words.clone();
+    hot.extend(cfg.stop_words.clone());
+    Recognizer::new(&model_path, 16000, &hot, cfg.hotwords_score)
+}
+
 pub fn run(rx: Receiver<WorkerMsg>) {
     let cfg0 = shared().config.lock().unwrap().clone();
 
-    let model_path = resolve_resource(&cfg0.model_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| cfg0.model_path.clone());
-
-    let stt = match Recognizer::new(&model_path, 16000) {
+    let mut stt = match build_recognizer() {
         Ok(r) => r,
         Err(e) => {
             ui::error_box(&format!(
@@ -71,7 +78,7 @@ pub fn run(rx: Receiver<WorkerMsg>) {
             return;
         }
     };
-    eprintln!("[engine] модель sherpa загружена: {model_path}");
+    eprintln!("[engine] модель sherpa загружена");
 
     let mut state = State::Idle;
     let mut enabled = true;
@@ -95,6 +102,21 @@ pub fn run(rx: Receiver<WorkerMsg>) {
                 stt.reset();
                 live.reset();
             }
+            WorkerMsg::Reload => {
+                if state == State::Dictating {
+                    stop_dictation(&cfg0, &stt, &mut state, &mut live);
+                }
+                match build_recognizer() {
+                    Ok(r) => {
+                        stt = r;
+                        live.reset();
+                        eprintln!("[engine] распознаватель пересоздан");
+                    }
+                    Err(e) => ui::error_box(&format!(
+                        "Не удалось пересоздать распознаватель:\n{e}"
+                    )),
+                }
+            }
             WorkerMsg::Toggle => {
                 if state == State::Dictating {
                     stop_dictation(&cfg0, &stt, &mut state, &mut live);
@@ -115,7 +137,8 @@ pub fn run(rx: Receiver<WorkerMsg>) {
 
                 match state {
                     State::Idle => {
-                        if !text.is_empty() && contains_word(&text, &cfg.wake_words).is_some() {
+                        if !text.is_empty() && contains_word(&text, &cfg.wake_words, true).is_some()
+                        {
                             start_dictation(&stt, &mut state, &mut live);
                             last_speech = Instant::now();
                         } else if endpoint {
@@ -133,7 +156,7 @@ pub fn run(rx: Receiver<WorkerMsg>) {
                             if !cfg.live_typing {
                                 live.reconcile(&shape(&cfg, &text));
                             }
-                            if contains_word(&text, &cfg.stop_words).is_some() {
+                            if contains_word(&text, &cfg.stop_words, false).is_some() {
                                 stop_dictation(&cfg, &stt, &mut state, &mut live);
                             } else {
                                 live.finalize(&cfg); // пробел за завершённой фразой
@@ -198,20 +221,57 @@ fn shape(cfg: &Config, raw: &str) -> String {
 }
 
 /// Возвращает найденное управляющее слово, если оно есть в тексте.
-fn contains_word(text: &str, words: &[String]) -> Option<String> {
+/// `fuzzy` — допускать правку на 1 символ (для wake-слов; стоп-слова точные,
+/// чтобы «стол»/«сток» случайно не останавливали диктовку).
+fn contains_word(text: &str, words: &[String], fuzzy: bool) -> Option<String> {
     let lower = text.to_lowercase();
-    let tokens: std::collections::HashSet<&str> = lower.split_whitespace().collect();
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
     for w in words {
         let w = w.to_lowercase();
+        if w.is_empty() {
+            continue;
+        }
         if w.contains(' ') {
             if lower.contains(&w) {
                 return Some(w);
             }
-        } else if tokens.contains(w.as_str()) {
+            continue;
+        }
+        if tokens.iter().any(|t| *t == w) {
             return Some(w);
+        }
+        if fuzzy {
+            let thr = (w.chars().count() / 5).clamp(1, 2);
+            if tokens.iter().any(|t| lev(t, &w) <= thr) {
+                return Some(w);
+            }
         }
     }
     None
+}
+
+/// Расстояние Левенштейна (для нечёткого совпадения активатора).
+fn lev(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m]
 }
 
 /// Убирает из текста управляющие слова.
