@@ -982,8 +982,12 @@ fn open_settings() {
         }
         SendMessageW(combo, CB_SETCURSEL, WPARAM(sel), LPARAM(0));
 
-        // режимы показа оверлея
-        for m in ["Всегда", "Только при диктовке", "Скрыт"] {
+        // режимы показа оверлея (подписи явные, чтобы не путать)
+        for m in [
+            "Всегда (не прячется на стоп)",
+            "Только при диктовке (прячется в покое)",
+            "Скрыт",
+        ] {
             SendMessageW(mode, CB_ADDSTRING, WPARAM(0), LPARAM(wide(m).as_ptr() as isize));
         }
         let mode_idx = match cfg.overlay_mode.as_str() {
