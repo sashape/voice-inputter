@@ -27,6 +27,7 @@ use windows::Win32::Graphics::Gdi::{
     GetDC, ReleaseDC, SelectObject, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, HBITMAP, HDC, HFONT, LOGFONTW,
 };
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
@@ -49,6 +50,9 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 
 const HOTKEY_ID: i32 = 1;
 const OVERLAY_TIMER: usize = 1;
+// интервал таймера оверлея: частый пока виден (плавно), редкий в покое (экономия)
+const TIMER_FAST: u32 = 8; // ~120 fps под timeBeginPeriod(1)
+const TIMER_IDLE: u32 = 40; // достаточно, чтобы вовремя поймать начало показа
 
 const ID_SETTINGS: usize = 1;
 const ID_ENABLED: usize = 2;
@@ -84,10 +88,16 @@ struct Ui {
     overlay: Option<Overlay>,
     bars: Vec<f32>,
     level_smooth: f32,
+    rec_t: f32,
+    show_t: f32,
+    hires: bool, // включён ли высокоточный таймер (пока оверлей на экране)
     anim_start: Option<Instant>,
+    last_tick: Option<Instant>,
     hovered: bool,
     hover_leave_at: Option<Instant>,
     tracking_leave: bool,
+    hover_region: Region,   // кнопка под курсором (для курсора-руки и подсветки)
+    hover_int: [f32; 3],    // сглаженная подсветка [mic, gear, close]
     last_dictating: bool,
     dict_ended_at: Option<Instant>,
     dismissed: bool,
@@ -113,10 +123,16 @@ impl Default for Ui {
             overlay: None,
             bars: vec![0.06; overlay::N_BARS],
             level_smooth: 0.0,
+            rec_t: 0.0,
+            show_t: 0.0,
+            hires: false,
             anim_start: None,
+            last_tick: None,
             hovered: false,
             hover_leave_at: None,
             tracking_leave: false,
+            hover_region: Region::None,
+            hover_int: [0.0; 3],
             last_dictating: false,
             dict_ended_at: None,
             dismissed: false,
@@ -274,8 +290,9 @@ pub fn run() {
         let device = shared().config.lock().unwrap().device_name.clone();
         rebuild_stream(device.as_deref());
 
-        // непрерывный таймер анимации волны
-        SetTimer(main, OVERLAY_TIMER, 33, None);
+        // таймер анимации: старт в «покойном» режиме (оверлей скрыт),
+        // ускоряется до TIMER_FAST + timeBeginPeriod, когда становится виден
+        SetTimer(main, OVERLAY_TIMER, TIMER_IDLE, None);
 
         eprintln!("[ui] запущено. Иконка в трее.");
 
@@ -522,9 +539,13 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
             }
             WM_MOUSEMOVE => {
+                let x = (lp.0 & 0xFFFF) as i16 as i32;
+                let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
                 UI.with_borrow_mut(|ui| {
                     ui.hovered = true;
                     ui.hover_leave_at = None;
+                    let scale = ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0);
+                    ui.hover_region = overlay::hit_test(x, y, hover_active(ui), scale);
                     if !ui.tracking_leave {
                         let mut tme = TRACKMOUSEEVENT {
                             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -538,11 +559,25 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 });
                 LRESULT(0)
             }
+            WM_SETCURSOR => {
+                // рука над кнопками, стрелка в остальных местах пилюли
+                let over_button = UI.with_borrow(|ui| {
+                    matches!(ui.hover_region, Region::Mic | Region::Gear | Region::Close)
+                });
+                if over_button {
+                    let hand = LoadCursorW(None, IDC_HAND).unwrap_or_default();
+                    SetCursor(hand);
+                    LRESULT(1)
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
+            }
             WM_MOUSELEAVE => {
                 UI.with_borrow_mut(|ui| {
                     ui.hovered = false;
                     ui.hover_leave_at = Some(Instant::now());
                     ui.tracking_leave = false;
+                    ui.hover_region = Region::None;
                 });
                 LRESULT(0)
             }
@@ -555,12 +590,11 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 match overlay::hit_test(x, y, active, scale) {
                     Region::Mic => crate::shared::send_worker(WorkerMsg::Toggle),
                     Region::Close => {
+                        // ✕ скрывает пилюлю в любом режиме; если шла диктовка — останавливает
                         if is_dictating() {
                             crate::shared::send_worker(WorkerMsg::Toggle);
-                        } else {
-                            // в покое ✕ прячет пилюлю (в режиме «Только при диктовке»)
-                            UI.with_borrow_mut(|ui| ui.dismissed = true);
                         }
+                        UI.with_borrow_mut(|ui| ui.dismissed = true);
                     }
                     Region::Gear => open_settings(),
                     _ => {}
@@ -650,53 +684,105 @@ fn tick_overlay() {
 
         let should_show = match mode.as_str() {
             "hidden" => false,
-            "always" => enabled,
+            // always: всегда видна, но ✕ прячет до следующей диктовки
+            "always" => enabled && !ui.dismissed,
             // dictation: диктовка + линжер idle-состояния + пока наведён курсор
             _ => dictating || (!ui.dismissed && (lingering || hover_active(ui))),
         };
 
+        // dt с прошлого кадра (клампим, чтобы пауза таймера не давала скачок)
+        let now = Instant::now();
+        let dt = ui.last_tick.map(|p| (now - p).as_secs_f32()).unwrap_or(0.016).clamp(0.001, 0.05);
+        ui.last_tick = Some(now);
+
         let visible = unsafe { IsWindowVisible(ui.overlay_hwnd).as_bool() };
-        if should_show {
-            if !visible {
-                // масштаб мог измениться (DPI/конфиг) — пересоздаём DIB
-                let want = overlay_scale_for(ui.overlay_hwnd);
-                let cur = ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0);
-                if (want - cur).abs() > 0.01 {
-                    rebuild_overlay_gdi(ui, want);
-                }
-                let scale = ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0);
-                let (ovw, ovh) = overlay::dims(scale);
-                let wa = workarea();
-                let x = wa.left + (wa.right - wa.left - ovw) / 2;
-                let y = wa.bottom - ovh - (24.0 * scale) as i32;
-                if let Some(ov) = ui.overlay.as_mut() {
-                    ov.x = x;
-                    ov.y = y;
-                }
-                ui.anim_start = Some(Instant::now());
-                for b in ui.bars.iter_mut() {
-                    *b = 0.06;
-                }
-                unsafe {
-                    let _ = ShowWindow(ui.overlay_hwnd, SW_SHOWNOACTIVATE);
-                }
+
+        // высокоточный частый таймер только пока оверлей на экране (в т.ч. при затухании);
+        // в покое — грубый таймер и обычная гранулярность (экономим CPU/батарею)
+        let on_screen = should_show || visible;
+        if on_screen && !ui.hires {
+            unsafe {
+                timeBeginPeriod(1);
+                SetTimer(ui.main, OVERLAY_TIMER, TIMER_FAST, None);
             }
+            ui.hires = true;
+        } else if !on_screen && ui.hires {
+            unsafe {
+                SetTimer(ui.main, OVERLAY_TIMER, TIMER_IDLE, None);
+                let _ = timeEndPeriod(1);
+            }
+            ui.hires = false;
+        }
+
+        // первичный показ: настраиваем позицию/масштаб и показываем окно (show_t поедет вверх)
+        if should_show && !visible {
+            // масштаб мог измениться (DPI/конфиг) — пересоздаём DIB
+            let want = overlay_scale_for(ui.overlay_hwnd);
+            let cur = ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0);
+            if (want - cur).abs() > 0.01 {
+                rebuild_overlay_gdi(ui, want);
+            }
+            let scale = ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0);
+            let (ovw, ovh) = overlay::dims(scale);
+            let wa = workarea();
+            let x = wa.left + (wa.right - wa.left - ovw) / 2;
+            let y = wa.bottom - ovh - (24.0 * scale) as i32;
+            if let Some(ov) = ui.overlay.as_mut() {
+                ov.x = x;
+                ov.y = y;
+            }
+            ui.anim_start = Some(Instant::now());
+            ui.show_t = 0.0;
+            for b in ui.bars.iter_mut() {
+                *b = 0.06;
+            }
+            unsafe {
+                let _ = ShowWindow(ui.overlay_hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
+
+        // рисуем, пока окно на экране (включая фазу затухания)
+        if on_screen {
+            // плавное появление/исчезание (быстрее вдвое: ~.25s)
+            let show_target = if should_show { 1.0 } else { 0.0 };
+            ui.show_t += (show_target - ui.show_t) * overlay::smooth_k(dt, 0.08);
+
             let t = ui
                 .anim_start
                 .map(|s| s.elapsed().as_secs_f32())
                 .unwrap_or(0.0);
-            // при диктовке — реальный уровень; в покое (idle) — приглушённый
+            // уровень микрофона: быстрая атака (бары резко отзываются на речь), мягкий спад
             let raw = current_level() as f32 / 1000.0;
-            ui.level_smooth += (raw - ui.level_smooth) * 0.25;
+            let tau_lvl = if raw > ui.level_smooth { 0.04 } else { 0.16 };
+            ui.level_smooth += (raw - ui.level_smooth) * overlay::smooth_k(dt, tau_lvl);
             let lvl = ui.level_smooth;
-            overlay::animate(&mut ui.bars, lvl, t, dictating);
+            // плавный переход микрофон↔стоп и внутреннее свечение (как в html: ~.3s)
+            let rec_target = if dictating { 1.0 } else { 0.0 };
+            ui.rec_t += (rec_target - ui.rec_t) * overlay::smooth_k(dt, 0.1);
+            // плавная подсветка кнопки под курсором (~.2s)
+            let hr = ui.hover_region;
+            let targets = [
+                (hr == Region::Mic) as u8 as f32,
+                (hr == Region::Gear) as u8 as f32,
+                (hr == Region::Close) as u8 as f32,
+            ];
+            let kh = overlay::smooth_k(dt, 0.08);
+            for i in 0..3 {
+                ui.hover_int[i] += (targets[i] - ui.hover_int[i]) * kh;
+            }
+            overlay::animate(&mut ui.bars, lvl, t, dt, dictating);
             draw_overlay(ui);
-        } else if visible {
-            ui.hovered = false;
-            ui.hover_leave_at = None;
-            ui.tracking_leave = false;
-            unsafe {
-                let _ = ShowWindow(ui.overlay_hwnd, SW_HIDE);
+
+            // полностью исчезло — прячем окно
+            if !should_show && ui.show_t < 0.02 {
+                ui.show_t = 0.0;
+                ui.hovered = false;
+                ui.hover_leave_at = None;
+                ui.tracking_leave = false;
+                ui.hover_region = Region::None;
+                unsafe {
+                    let _ = ShowWindow(ui.overlay_hwnd, SW_HIDE);
+                }
             }
         }
     });
@@ -731,7 +817,9 @@ fn draw_overlay(ui: &Ui) {
         &overlay::Frame {
             bars: &ui.bars,
             hovered: hover_active(ui),
-            recording: is_dictating(),
+            rec_t: ui.rec_t,
+            hover: ui.hover_int,
+            show_t: ui.show_t,
             t,
         },
         scale,

@@ -86,13 +86,24 @@ pub fn build_stream(
     let mut resampler = Resampler::new(in_rate);
     let err_fn = |e| eprintln!("[audio] ошибка потока: {e}");
 
+    // адаптивный опорный уровень RMS (авто-усиление под конкретный микрофон)
+    let mut ref_lvl = 0.02f32;
+
     // общий обработчик моно-блока
     let mut handle_mono = move |mono: Vec<f32>| {
-        // уровень (RMS) → 0..1000 для волны
+        // уровень для волны: RMS с шумовым гейтом и нормировкой к недавнему пику
         if !mono.is_empty() {
             let sum: f32 = mono.iter().map(|x| x * x).sum();
             let rms = (sum / mono.len() as f32).sqrt();
-            let level = (rms * 3.5).clamp(0.0, 1.0);
+            // опорный пик: мгновенная атака, медленный спад — подстраивается под голос
+            if rms > ref_lvl {
+                ref_lvl = rms;
+            } else {
+                ref_lvl += (rms - ref_lvl) * 0.003;
+            }
+            let refv = ref_lvl.max(0.012); // не делим на слишком малое (тихая комната)
+            let gated = (rms - 0.0018).max(0.0); // отсечь фоновый шум
+            let level = (gated / (refv * 0.6)).clamp(0.0, 1.0);
             send_level((level * 1000.0) as u32);
         }
         let samples = resampler.process(&mono);

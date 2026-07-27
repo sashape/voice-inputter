@@ -8,18 +8,18 @@
 
 use std::cell::RefCell;
 use tiny_skia::{
-    Color, FillRule, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, PixmapPaint,
-    Point, Shader, SpreadMode, Stroke, Transform,
+    Color, FillRule, GradientStop, LinearGradient, LineCap, Mask, Paint, PathBuilder, Pixmap,
+    PixmapPaint, Point, RadialGradient, Shader, SpreadMode, Stroke, Transform,
 };
 
 // ── размеры окна и раскладка (логич. px) ──────────────────────────────────
-pub const OV_W: i32 = 400;
+pub const OV_W: i32 = 300;
 pub const OV_H: i32 = 150;
-pub const N_BARS: usize = 30;
+pub const N_BARS: usize = 16;
 
 const PILL_X: f32 = 50.0;
 const PILL_Y: f32 = 46.0;
-const PILL_W: f32 = 300.0;
+const PILL_W: f32 = 200.0; // короче: 16 баров
 const PILL_H: f32 = 60.0;
 const PILL_R: f32 = 30.0;
 const PILL_CY: f32 = PILL_Y + PILL_H / 2.0; // 76
@@ -30,13 +30,13 @@ const MIC_R: f32 = 24.0;
 
 const WF_X0: f32 = 114.0;
 const BAR_W: f32 = 3.5;
-const BAR_SLOT: f32 = 7.5;
-const WF_HALF: f32 = 22.0;
+const BAR_SLOT: f32 = 7.5; // как в исходном дизайне (по ширине)
+const WF_HALF: f32 = MIC_R * 0.85; // потолок баров = 85% высоты кнопки
 
 const CTRL_R: f32 = 17.0;
 const CTRL_CY: f32 = 19.0;
-const GEAR_CX: f32 = 179.0;
-const CLOSE_CX: f32 = 221.0;
+const GEAR_CX: f32 = 129.0; // над центром укороченной пилюли (X=150)
+const CLOSE_CX: f32 = 171.0;
 
 // ── палитра ────────────────────────────────────────────────────────────────
 type Rgb = (u8, u8, u8);
@@ -60,7 +60,9 @@ pub enum Region {
 pub struct Frame<'a> {
     pub bars: &'a [f32],
     pub hovered: bool,
-    pub recording: bool,
+    pub rec_t: f32,        // плавный переход покой↔запись (0..1)
+    pub hover: [f32; 3],   // подсветка кнопок [mic, gear, close] (0..1)
+    pub show_t: f32,       // появление/исчезание (0 скрыто → 1 показано)
     pub t: f32,
 }
 
@@ -70,7 +72,9 @@ pub fn dims(s: f32) -> (i32, i32) {
 }
 
 // ── анимация высот баров (запись модулируется голосом) ─────────────────────
-pub fn animate(bars: &mut [f32], level: f32, t: f32, recording: bool) {
+/// Обновляет высоты баров. `dt` — время с прошлого кадра (сек): сглаживание
+/// привязано к нему, поэтому частота кадров (30/60 fps) не влияет на скорость.
+pub fn animate(bars: &mut [f32], level: f32, t: f32, dt: f32, recording: bool) {
     let n = bars.len();
     if n == 0 {
         return;
@@ -79,20 +83,35 @@ pub fn animate(bars: &mut [f32], level: f32, t: f32, recording: bool) {
     for i in 0..n {
         let center = 1.0 - (i as f32 - mid).abs() / mid;
         let target = if recording {
+            // Дёрганый «спектр» как раньше, но его включает ГОЛОС: нет голоса — замирает.
             let s = i as f32 * 1.7;
             let env = 0.5 + 0.5 * (t * 1.7 + s * 2.3).sin();
             let fast = ((t * 6.0 + s).sin() * (t * 3.3 + s * 0.6).sin()).abs();
-            let base = 0.2 + (0.3 + 0.6 * center) * (0.35 + 0.65 * fast) * env;
-            (base * (0.5 + 0.8 * level)).clamp(0.06, 1.0)
+            let burst = (0.35 + 0.65 * center) * (0.35 + 0.65 * fast) * env; // 0..~1 дёрганье
+            // в тишине — спокойный низкий пол (лёгкое дыхание, без дёрганья)
+            let calm = 0.09 + 0.025 * (0.5 + 0.5 * (t * 1.1 + s * 0.5).sin());
+            (calm + level * 1.55 * burst).clamp(0.06, 1.0)
         } else {
-            let w1 = 0.5 + 0.5 * (t * 1.3 - i as f32 * 0.45).sin();
-            let w2 = 0.5 + 0.5 * (t * 0.7 + i as f32 * 0.3).sin();
-            let wave = w1 * 0.7 + w2 * 0.3;
-            0.14 + 0.3 * wave * (0.5 + 0.5 * center)
+            // две бегущие волны по ширине (~2 гребня на 16 баров), разная скорость — переливаются
+            let w1 = 0.5 + 0.5 * (t * 1.3 - i as f32 * 0.84).sin();
+            let w2 = 0.5 + 0.5 * (t * 0.9 - i as f32 * 0.84).sin();
+            let wave = w1 * 0.6 + w2 * 0.4;
+            // полный размах от минимума к максимуму (ещё −10% к высоте)
+            0.126 + 0.378 * wave * (0.82 + 0.18 * center)
         };
-        let k = if recording { 0.35 } else { 0.1 };
-        bars[i] += (target - bars[i]) * k;
+        // запись — отзывчивее (за голосом), покой — плавнее
+        let tau = if recording { 0.05 } else { 0.313 };
+        bars[i] += (target - bars[i]) * smooth_k(dt, tau);
     }
+}
+
+/// Коэффициент экспоненциального сглаживания, независимый от частоты кадров:
+/// доля пути к цели за время `dt` при постоянной времени `tau`.
+pub fn smooth_k(dt: f32, tau: f32) -> f32 {
+    if tau <= 0.0 {
+        return 1.0;
+    }
+    (1.0 - (-dt / tau).exp()).clamp(0.0, 1.0)
 }
 
 // ── hit-test ──────────────────────────────────────────────────────────────
@@ -122,6 +141,9 @@ pub fn hit_test(x: i32, y: i32, active: bool, s: f32) -> Region {
 thread_local! {
     // кэш статичной тени (пилюля не двигается) — блюрим один раз на масштаб
     static SHADOW: RefCell<Option<(i32, i32, Pixmap)>> = const { RefCell::new(None) };
+    // кэш свечения под кнопкой: форма не зависит от rec_t (меняется лишь opacity),
+    // поэтому блюрим один раз на масштаб и блитим с прозрачностью 0.5*rec_t
+    static MIC_GLOW: RefCell<Option<(i32, i32, Pixmap)>> = const { RefCell::new(None) };
 }
 
 // ── отрисовка кадра ───────────────────────────────────────────────────────
@@ -131,16 +153,32 @@ pub fn render(buf: &mut [u8], f: &Frame, s: f32) {
 
     draw_shadow(&mut pm, s);
     draw_pill(&mut pm, s);
+    draw_inner_glow(&mut pm, s, f.rec_t);
     draw_aurora(&mut pm, s, f.t);
-    draw_highlight(&mut pm, s);
-    draw_mic(&mut pm, s, f.recording);
+    draw_mic(&mut pm, s, f.rec_t, f.hover[0]);
     draw_bars(&mut pm, f.bars, s);
     if f.hovered {
-        draw_controls(&mut pm, s);
+        draw_controls(&mut pm, s, f.hover[1], f.hover[2]);
     }
 
+    // появление/исчезание: масштаб (0.92→1), сдвиг вверх (14px→0) и затухание всего кадра
+    let display = if f.show_t < 0.999 {
+        let show = f.show_t.clamp(0.0, 1.0);
+        let mut out = Pixmap::new(w as u32, h as u32).unwrap();
+        let scf = lerp_f(0.92, 1.0, show);
+        let dy = (1.0 - show) * 14.0 * s;
+        let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+        let tr = Transform::from_translate(cx, cy + dy)
+            .pre_scale(scf, scf)
+            .pre_translate(-cx, -cy);
+        out.draw_pixmap(0, 0, pm.as_ref(), &PixmapPaint { opacity: show, ..Default::default() }, tr, None);
+        out
+    } else {
+        pm
+    };
+
     // premultiplied RGBA (tiny-skia) → прямая RGBA (ui.rs домножит сам)
-    let src = pm.data();
+    let src = display.data();
     let px = (w * h) as usize;
     for i in 0..px {
         let a = src[i * 4 + 3] as u32;
@@ -207,66 +245,80 @@ fn draw_aurora(pm: &mut Pixmap, s: f32, t: f32) {
     pm.fill_path(&pill_path(s), &p, FillRule::Winding, Transform::identity(), Some(&mask));
 }
 
-fn draw_highlight(pm: &mut Pixmap, s: f32) {
-    let mut p = Paint::default();
-    p.set_color(Color::from_rgba8(255, 255, 255, 18));
-    p.anti_alias = true;
-    let path = round_rect(sc(PILL_X + 12.0, s), sc(PILL_Y + 1.0, s), sc(PILL_W - 24.0, s), sc(1.6, s), sc(0.8, s));
-    pm.fill_path(&path, &p, FillRule::Winding, Transform::identity(), None);
-}
-
-fn draw_mic(pm: &mut Pixmap, s: f32, recording: bool) {
+fn draw_mic(pm: &mut Pixmap, s: f32, rec_t: f32, hover: f32) {
     let (mcx, mcy, mr) = (sc(MIC_CX, s), sc(MIC_CY, s), sc(MIC_R, s));
     let mic = round_rect(mcx - mr, mcy - mr, mr * 2.0, mr * 2.0, mr);
-    // тёмный градиентный круг
+    // тёмный градиентный круг (основа)
     let mut mp = Paint::default();
     mp.shader = lin(mcx, mcy - mr, mcx, mcy + mr, vec![(0.0, Color::from_rgba8(35, 37, 60, 255)), (1.0, Color::from_rgba8(25, 27, 45, 255))]);
     mp.anti_alias = true;
     pm.fill_path(&mic, &mp, FillRule::Winding, Transform::identity(), None);
 
-    if recording {
-        // мягкое цветное свечение под кнопкой
-        {
-            let (w, h) = (pm.width(), pm.height());
+    // мягкое цветное свечение под кнопкой — проявляется вместе с записью.
+    // Форма постоянна → блюрим один раз на масштаб и кэшируем (см. MIC_GLOW).
+    if rec_t > 0.01 {
+        let (w, h) = (pm.width(), pm.height());
+        let cached = MIC_GLOW.with(|c| matches!(&*c.borrow(), Some((cw, ch, _)) if *cw == w as i32 && *ch == h as i32));
+        if !cached {
             let mut glow = Pixmap::new(w, h).unwrap();
             let mut gp = Paint::default();
             gp.set_color(col(MAGENTA, 0.9));
             gp.anti_alias = true;
             glow.fill_path(&round_rect(mcx - mr * 0.8, mcy - mr * 0.4, mr * 1.6, mr * 1.4, mr * 0.6), &gp, FillRule::Winding, Transform::identity(), None);
             blur(&mut glow, (7.0 * s) as usize);
-            pm.draw_pixmap(0, 0, glow.as_ref(), &PixmapPaint { opacity: 0.5, ..Default::default() }, Transform::identity(), None);
-            // перерисуем тёмный круг поверх свечения (свечение только вокруг)
-            pm.fill_path(&mic, &mp, FillRule::Winding, Transform::identity(), None);
+            MIC_GLOW.with(|c| *c.borrow_mut() = Some((w as i32, h as i32, glow)));
         }
-        // градиентная заливка круга (135°)
+        MIC_GLOW.with(|c| {
+            if let Some((_, _, glow)) = &*c.borrow() {
+                pm.draw_pixmap(0, 0, glow.as_ref(), &PixmapPaint { opacity: 0.5 * rec_t, ..Default::default() }, Transform::identity(), None);
+            }
+        });
+        // перерисуем тёмный круг поверх свечения (свечение только вокруг)
+        pm.fill_path(&mic, &mp, FillRule::Winding, Transform::identity(), None);
+        // градиентная заливка круга (135°) — по мере rec_t
         let mut fp = Paint::default();
-        fp.shader = lin(mcx - mr, mcy - mr, mcx + mr, mcy + mr, vec![(0.0, col(VIOLET, 1.0)), (0.45, col(MAGENTA, 1.0)), (1.0, col(PINK, 1.0))]);
+        fp.shader = lin(mcx - mr, mcy - mr, mcx + mr, mcy + mr, vec![(0.0, col(VIOLET, rec_t)), (0.45, col(MAGENTA, rec_t)), (1.0, col(PINK, rec_t))]);
         fp.anti_alias = true;
         pm.fill_path(&mic, &fp, FillRule::Winding, Transform::identity(), None);
-        // квадрат-стоп (светлый градиент)
+    }
+
+    // подсветка при наведении — мягко высветляем круг
+    if hover > 0.01 {
+        let mut hp = Paint::default();
+        hp.set_color(col((255, 255, 255), 0.12 * hover));
+        hp.anti_alias = true;
+        pm.fill_path(&mic, &hp, FillRule::Winding, Transform::identity(), None);
+    }
+
+    // иконка микрофона — уезжает (scale 1→0.5, rotate 0→-20°), гаснет
+    if rec_t < 0.99 {
+        let tr = rot_scale_at(lerp_f(0.0, -20.0, rec_t), lerp_f(1.0, 0.5, rec_t), mcx, mcy);
+        draw_mic_glyph(pm, mcx, mcy, s, (1.0 - rec_t) * 0.95, tr);
+    }
+    // квадрат-стоп — приезжает (scale 0.4→1, rotate 40°→0), проявляется
+    if rec_t > 0.01 {
+        let tr = rot_scale_at(lerp_f(40.0, 0.0, rec_t), lerp_f(0.4, 1.0, rec_t), mcx, mcy);
         let sh = sc(7.5, s);
         let mut sp = Paint::default();
-        sp.shader = lin(mcx - sh, mcy - sh, mcx + sh, mcy + sh, vec![(0.0, col((233, 228, 255), 1.0)), (1.0, col((243, 196, 227), 1.0))]);
+        sp.shader = lin(mcx - sh, mcy - sh, mcx + sh, mcy + sh, vec![(0.0, col((233, 228, 255), rec_t)), (1.0, col((243, 196, 227), rec_t))]);
         sp.anti_alias = true;
-        pm.fill_path(&round_rect(mcx - sh, mcy - sh, sh * 2.0, sh * 2.0, sc(5.0, s)), &sp, FillRule::Winding, Transform::identity(), None);
-    } else {
-        draw_mic_glyph(pm, mcx, mcy, s);
+        pm.fill_path(&round_rect(mcx - sh, mcy - sh, sh * 2.0, sh * 2.0, sc(5.0, s)), &sp, FillRule::Winding, tr, None);
     }
 }
 
-/// Иконка микрофона по геометрии SVG (viewBox 24, масштаб g).
-fn draw_mic_glyph(pm: &mut Pixmap, mcx: f32, mcy: f32, s: f32) {
+/// Иконка микрофона по геометрии SVG (viewBox 24, масштаб g). `tr` — трансформ анимации.
+fn draw_mic_glyph(pm: &mut Pixmap, mcx: f32, mcy: f32, s: f32, alpha: f32, tr: Transform) {
     let g = 0.92;
     let vx = |v: f32| mcx + sc((v - 12.0) * g, s);
     let vy = |v: f32| mcy + sc((v - 12.0) * g, s);
     let mut ip = Paint::default();
-    ip.set_color(Color::from_rgba8(207, 200, 245, 242));
+    ip.set_color(col(ICON, alpha));
     ip.anti_alias = true;
     // тело-капсула
-    pm.fill_path(&round_rect(vx(9.0), vy(3.0), sc(6.0 * g, s), sc(12.0 * g, s), sc(3.0 * g, s)), &ip, FillRule::Winding, Transform::identity(), None);
+    pm.fill_path(&round_rect(vx(9.0), vy(3.0), sc(6.0 * g, s), sc(12.0 * g, s), sc(3.0 * g, s)), &ip, FillRule::Winding, tr, None);
     let mut stroke = Stroke::default();
     stroke.width = sc(1.8 * g, s);
-    stroke.line_cap = tiny_skia::LineCap::Round;
+    stroke.line_cap = LineCap::Round;
     // держатель — нижний полукруг r=6g (огибает тело)
     let (hcx, hcy, r) = (mcx, vy(11.0), sc(6.0 * g, s));
     let k = 0.5523 * r;
@@ -275,7 +327,7 @@ fn draw_mic_glyph(pm: &mut Pixmap, mcx: f32, mcy: f32, s: f32) {
     arc.cubic_to(hcx - r, hcy + k, hcx - k, hcy + r, hcx, hcy + r);
     arc.cubic_to(hcx + k, hcy + r, hcx + r, hcy + k, hcx + r, hcy);
     if let Some(path) = arc.finish() {
-        pm.stroke_path(&path, &ip, &stroke, Transform::identity(), None);
+        pm.stroke_path(&path, &ip, &stroke, tr, None);
     }
     // ножка + основание
     let mut st = PathBuilder::new();
@@ -284,14 +336,36 @@ fn draw_mic_glyph(pm: &mut Pixmap, mcx: f32, mcy: f32, s: f32) {
     st.move_to(vx(9.0), vy(21.0));
     st.line_to(vx(15.0), vy(21.0));
     if let Some(path) = st.finish() {
-        pm.stroke_path(&path, &ip, &stroke, Transform::identity(), None);
+        pm.stroke_path(&path, &ip, &stroke, tr, None);
     }
+}
+
+/// Внутреннее свечение пилюли — два радиальных пятна, проявляются с записью.
+fn draw_inner_glow(pm: &mut Pixmap, s: f32, rec_t: f32) {
+    if rec_t <= 0.01 {
+        return;
+    }
+    let mask = pill_mask(pm, s);
+    let (px, py) = (sc(PILL_X, s), sc(PILL_Y, s));
+    let (pw, ph) = (sc(PILL_W, s), sc(PILL_H, s));
+    // фиолетовое пятно снизу-слева
+    let mut p1 = Paint::default();
+    p1.anti_alias = true;
+    p1.shader = radial(px + pw * 0.30, py + ph * 1.10, pw * 0.6, vec![(0.0, col(VIOLET, 0.30 * rec_t)), (0.65, col(VIOLET, 0.0))]);
+    pm.fill_path(&pill_path(s), &p1, FillRule::Winding, Transform::identity(), Some(&mask));
+    // розовое пятно сверху-справа
+    let mut p2 = Paint::default();
+    p2.anti_alias = true;
+    p2.shader = radial(px + pw * 0.72, py - ph * 0.10, pw * 0.6, vec![(0.0, col(PINK, 0.24 * rec_t)), (0.65, col(PINK, 0.0))]);
+    pm.fill_path(&pill_path(s), &p2, FillRule::Winding, Transform::identity(), Some(&mask));
 }
 
 fn draw_bars(pm: &mut Pixmap, bars: &[f32], s: f32) {
     let n = bars.len().max(1);
     let (w, h) = (pm.width(), pm.height());
     let mcy = sc(MIC_CY, s);
+    // бары могут «перерастать» пилюлю — клипаем их по её форме
+    let mask = pill_mask(pm, s);
     // свечение — во вспомогательном пиксмапе, потом блюр
     let mut glow = Pixmap::new(w, h).unwrap();
     for (i, &lv) in bars.iter().enumerate() {
@@ -304,7 +378,7 @@ fn draw_bars(pm: &mut Pixmap, bars: &[f32], s: f32) {
         glow.fill_path(&round_rect(bx, mcy - bh, sc(BAR_W, s), bh * 2.0, sc(BAR_W / 2.0, s)), &p, FillRule::Winding, Transform::identity(), None);
     }
     blur(&mut glow, (3.0 * s) as usize);
-    pm.draw_pixmap(0, 0, glow.as_ref(), &PixmapPaint { opacity: 0.55, ..Default::default() }, Transform::identity(), None);
+    pm.draw_pixmap(0, 0, glow.as_ref(), &PixmapPaint { opacity: 0.55, ..Default::default() }, Transform::identity(), Some(&mask));
     // сами бары (вертикальный градиент яркий→приглушённый)
     for (i, &lv) in bars.iter().enumerate() {
         let c = palette_at(i as f32 / (n as f32 - 1.0));
@@ -313,17 +387,25 @@ fn draw_bars(pm: &mut Pixmap, bars: &[f32], s: f32) {
         let mut p = Paint::default();
         p.shader = lin(bx, mcy - bh, bx, mcy + bh, vec![(0.0, col(c, 1.0)), (1.0, col(c, 0.6))]);
         p.anti_alias = true;
-        pm.fill_path(&round_rect(bx, mcy - bh, sc(BAR_W, s), bh * 2.0, sc(BAR_W / 2.0, s)), &p, FillRule::Winding, Transform::identity(), None);
+        pm.fill_path(&round_rect(bx, mcy - bh, sc(BAR_W, s), bh * 2.0, sc(BAR_W / 2.0, s)), &p, FillRule::Winding, Transform::identity(), Some(&mask));
     }
 }
 
-fn draw_controls(pm: &mut Pixmap, s: f32) {
-    for cx in [GEAR_CX, CLOSE_CX] {
+fn draw_controls(pm: &mut Pixmap, s: f32, hover_gear: f32, hover_close: f32) {
+    for (cx, hv) in [(GEAR_CX, hover_gear), (CLOSE_CX, hover_close)] {
         let (ccx, ccy, cr) = (sc(cx, s), sc(CTRL_CY, s), sc(CTRL_R, s));
+        let circle = round_rect(ccx - cr, ccy - cr, cr * 2.0, cr * 2.0, cr);
         let mut p = Paint::default();
         p.shader = lin(ccx, ccy - cr, ccx, ccy + cr, vec![(0.0, Color::from_rgba8(35, 37, 60, 242)), (1.0, Color::from_rgba8(22, 24, 40, 242))]);
         p.anti_alias = true;
-        pm.fill_path(&round_rect(ccx - cr, ccy - cr, cr * 2.0, cr * 2.0, cr), &p, FillRule::Winding, Transform::identity(), None);
+        pm.fill_path(&circle, &p, FillRule::Winding, Transform::identity(), None);
+        // подсветка при наведении
+        if hv > 0.01 {
+            let mut hp = Paint::default();
+            hp.set_color(col((255, 255, 255), 0.14 * hv));
+            hp.anti_alias = true;
+            pm.fill_path(&circle, &hp, FillRule::Winding, Transform::identity(), None);
+        }
     }
     // иконка ⚙️
     {
@@ -397,6 +479,35 @@ fn lin(x0: f32, y0: f32, x1: f32, y1: f32, stops: Vec<(f32, Color)>) -> Shader<'
     let gs = stops.into_iter().map(|(p, c)| GradientStop::new(p, c)).collect();
     LinearGradient::new(Point::from_xy(x0, y0), Point::from_xy(x1, y1), gs, SpreadMode::Pad, Transform::identity())
         .unwrap_or_else(|| Shader::SolidColor(Color::from_rgba8(0, 0, 0, 0)))
+}
+
+fn radial(cx: f32, cy: f32, r: f32, stops: Vec<(f32, Color)>) -> Shader<'static> {
+    let gs = stops.into_iter().map(|(p, c)| GradientStop::new(p, c)).collect();
+    let c = Point::from_xy(cx, cy);
+    RadialGradient::new(c, c, r, gs, SpreadMode::Pad, Transform::identity())
+        .unwrap_or_else(|| Shader::SolidColor(Color::from_rgba8(0, 0, 0, 0)))
+}
+
+/// Маска по форме пилюли (для клиппинга свечения внутрь).
+fn pill_mask(pm: &Pixmap, s: f32) -> Mask {
+    let mut mask = Mask::new(pm.width(), pm.height()).unwrap();
+    mask.fill_path(&pill_path(s), FillRule::Winding, true, Transform::identity());
+    mask
+}
+
+/// Поворот на `deg` + равномерный масштаб `sl` вокруг точки (cx, cy).
+fn rot_scale_at(deg: f32, sl: f32, cx: f32, cy: f32) -> Transform {
+    let r = deg.to_radians();
+    let (c, si) = (r.cos() * sl, r.sin() * sl);
+    // [c -si; si c] с последующим сдвигом, чтобы (cx,cy) остался на месте
+    let (sx, kx, ky, sy) = (c, -si, si, c);
+    let tx = cx - (sx * cx + kx * cy);
+    let ty = cy - (ky * cx + sy * cy);
+    Transform::from_row(sx, ky, kx, sy, tx, ty)
+}
+
+fn lerp_f(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
 }
 
 fn col(c: Rgb, a: f32) -> Color {
@@ -511,15 +622,21 @@ mod tests {
     #[test]
     #[ignore]
     fn render_preview() {
-        let rec = std::env::var("PREVIEW_REC").map(|v| v != "0").unwrap_or(true);
+        // PREVIEW_REC: 0..1 — доля перехода (0 покой, 1 запись, дробь — середина)
+        let rec_t = std::env::var("PREVIEW_REC").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0).clamp(0.0, 1.0);
+        let rec = rec_t > 0.5;
+        let tt = std::env::var("PREVIEW_T").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.3);
+        let lvl = std::env::var("PREVIEW_LEVEL").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(if rec { 0.7 } else { 0.05 });
         let mut bars = vec![0.06f32; N_BARS];
         for _ in 0..60 {
-            animate(&mut bars, if rec { 0.7 } else { 0.05 }, 1.3, rec);
+            animate(&mut bars, lvl, tt, 0.016, rec);
         }
         let scale = std::env::var("PREVIEW_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
         let (w, h) = dims(scale);
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        render(&mut buf, &Frame { bars: &bars, hovered: true, recording: rec, t: 1.3 }, scale);
+        let hover = std::env::var("PREVIEW_HOVER").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+        let show_t = std::env::var("PREVIEW_SHOW").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+        render(&mut buf, &Frame { bars: &bars, hovered: true, rec_t, hover: [hover, 0.0, 0.0], show_t, t: tt }, scale);
         let bg = (24u8, 26u8, 36u8);
         let mut rgb = vec![0u8; (w * h * 3) as usize];
         for p in 0..(w * h) as usize {
@@ -533,5 +650,30 @@ mod tests {
         let out = std::env::temp_dir().join(format!("voice_inputter_render_{scale}_{rec}.bmp"));
         write_bmp(out.to_str().unwrap(), w, h, &rgb);
         println!("wrote {}", out.display());
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_render() {
+        // замер стоимости одного кадра render() — самый тяжёлый путь: rec_t=1
+        let scale = std::env::var("PREVIEW_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+        let mut bars = vec![0.06f32; N_BARS];
+        for _ in 0..60 {
+            animate(&mut bars, 0.7, 1.3, 0.016, true);
+        }
+        let (w, h) = dims(scale);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        // прогрев (первый кадр строит thread_local кэш тени)
+        for _ in 0..5 {
+            render(&mut buf, &Frame { bars: &bars, hovered: true, rec_t: 1.0, hover: [0.0; 3], show_t: 1.0, t: 1.3 }, scale);
+        }
+        let n = 300;
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            let t = i as f32 * 0.033;
+            render(&mut buf, &Frame { bars: &bars, hovered: true, rec_t: 1.0, hover: [0.0; 3], show_t: 1.0, t }, scale);
+        }
+        let per = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        println!("scale={scale} {w}x{h}: {per:.3} ms/frame  (budget: 16.7ms@60fps, 33ms@30fps)");
     }
 }
