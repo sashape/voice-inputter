@@ -9,6 +9,7 @@
     "overlay_mode": "always",
     "hotwords_score": 2.0,
     "live_typing": true,
+  "check_updates": true,
     "append_space": true,
     "capitalize": true
 }

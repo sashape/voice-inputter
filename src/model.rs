@@ -6,18 +6,10 @@
 
 use crate::config::{data_dir, resolve_resource};
 use crate::shared::{send_worker, shared, WorkerMsg};
-use std::ffi::c_void;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-
-use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Networking::WinHttp::{
-    WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
-    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_CONTENT_LENGTH,
-    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
-};
 
 const HOST: &str = "github.com";
 const PATH_PREFIX: &str = "/k2-fsa/sherpa-onnx/releases/download/asr-models/";
@@ -138,96 +130,33 @@ fn install() -> Result<(), String> {
     Ok(())
 }
 
-/// Скачивание с прогрессом; отмена проверяется между блоками.
+/// Скачивание с прогрессом; отмена проверяется на каждом куске.
 fn download(path: &str, out: &std::path::Path) -> Result<(), String> {
-    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
-    let (host, path_w, agent) = (wide(HOST), wide(path), wide("VoiceInputter"));
-    let verb = wide("GET");
-
-    unsafe {
-        let session = WinHttpOpen(
-            PCWSTR(agent.as_ptr()),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        );
-        if session.is_null() {
-            return Err("WinHttpOpen: нет доступа к сети".into());
+    use std::io::Write;
+    let mut file = std::fs::File::create(out).map_err(|e| format!("не создать файл: {e}"))?;
+    let mut failed: Option<String> = None;
+    let mut sink = |chunk: &[u8], got: u64, total: u64| {
+        if CANCEL.load(Ordering::SeqCst) {
+            return false;
         }
-        let _s = Handle(session);
-        // резолв/коннект/отправка/приём: по 30 с, чтения хватит и меньше
-        let _ = WinHttpSetTimeouts(session, 30_000, 30_000, 30_000, 30_000);
-
-        let conn = WinHttpConnect(session, PCWSTR(host.as_ptr()), 443, 0);
-        if conn.is_null() {
-            return Err(format!("не подключиться к {HOST}"));
+        if let Err(e) = file.write_all(chunk) {
+            failed = Some(format!("не записать файл: {e}"));
+            return false;
         }
-        let _c = Handle(conn);
-
-        let req = WinHttpOpenRequest(
-            conn,
-            PCWSTR(verb.as_ptr()),
-            PCWSTR(path_w.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            std::ptr::null_mut(),
-            WINHTTP_FLAG_SECURE,
-        );
-        if req.is_null() {
-            return Err("WinHttpOpenRequest не удался".into());
-        }
-        let _r = Handle(req);
-
-        WinHttpSendRequest(req, None, None, 0, 0, 0).map_err(|e| format!("запрос не отправлен: {e}"))?;
-        WinHttpReceiveResponse(req, std::ptr::null_mut()).map_err(|e| format!("нет ответа: {e}"))?;
-
-        let status = query_number(req, WINHTTP_QUERY_STATUS_CODE).unwrap_or(0);
-        if status != 200 {
-            return Err(format!("сервер ответил {status}"));
-        }
-        let total = query_number(req, WINHTTP_QUERY_CONTENT_LENGTH).unwrap_or(0) as u64;
-
-        let mut file = std::fs::File::create(out).map_err(|e| format!("не создать файл: {e}"))?;
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut got = 0u64;
-        loop {
-            if CANCEL.load(Ordering::SeqCst) {
-                let _ = std::fs::remove_file(out);
-                return Err("отменено".into());
-            }
-            let mut read = 0u32;
-            WinHttpReadData(req, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut read)
-                .map_err(|e| format!("обрыв загрузки: {e}"))?;
-            if read == 0 {
-                break;
-            }
-            use std::io::Write;
-            file.write_all(&buf[..read as usize]).map_err(|e| format!("не записать файл: {e}"))?;
-            got += read as u64;
-            set(Status::Downloading { got, total });
-        }
-        if total > 0 && got < total {
-            return Err("загрузка прервалась".into());
-        }
+        set(Status::Downloading { got, total });
+        true
+    };
+    let r = crate::http::get(HOST, path, &mut sink);
+    drop(file);
+    if let Some(e) = failed {
+        let _ = std::fs::remove_file(out);
+        return Err(e);
+    }
+    if let Err(e) = r {
+        let _ = std::fs::remove_file(out);
+        return Err(e);
     }
     Ok(())
-}
-
-/// Числовой заголовок ответа (код статуса, длина содержимого).
-unsafe fn query_number(req: *mut c_void, level: u32) -> Option<u32> {
-    let mut v = 0u32;
-    let mut len = std::mem::size_of::<u32>() as u32;
-    WinHttpQueryHeaders(
-        req,
-        level | WINHTTP_QUERY_FLAG_NUMBER,
-        PCWSTR::null(),
-        Some(&mut v as *mut u32 as *mut c_void),
-        &mut len,
-        std::ptr::null_mut(),
-    )
-    .ok()
-    .map(|_| v)
 }
 
 /// Распаковка `.tar.bz2` системным tar.exe (bsdtar, Windows 10 1803+).
@@ -251,17 +180,6 @@ fn extract(archive: &std::path::Path, dir: &std::path::Path) -> Result<(), Strin
     Ok(())
 }
 
-/// Закрывает HINTERNET на выходе из области видимости.
-struct Handle(*mut c_void);
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = WinHttpCloseHandle(self.0);
-        }
-    }
-}
-
 /// Подпись вида «12,4 / 23,0 МБ».
 pub fn human(got: u64, total: u64) -> String {
     let mb = |v: u64| v as f64 / (1024.0 * 1024.0);
@@ -271,10 +189,6 @@ pub fn human(got: u64, total: u64) -> String {
         format!("{:.1} МБ", mb(got)).replace('.', ",")
     }
 }
-
-// PWSTR используется только для читаемости сигнатур WinHTTP-обёрток
-#[allow(dead_code)]
-fn _unused(_: PWSTR) {}
 
 #[cfg(test)]
 mod tests {

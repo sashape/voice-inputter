@@ -87,14 +87,15 @@ enum Id {
     Space,
     Caps,
     Startup,
+    Updates,
     Cancel,
     Save,
 }
-const N_ID: usize = 18;
+const N_ID: usize = 19;
 const ALL_IDS: [Id; N_ID] = [
     Id::Close, Id::Device, Id::Wake, Id::Stop, Id::Hotkey, Id::Mode0, Id::Mode1, Id::Mode2,
     Id::Live, Id::More, Id::Silence, Id::OvScale, Id::Hotwords, Id::Space, Id::Caps, Id::Startup,
-    Id::Cancel, Id::Save,
+    Id::Updates, Id::Cancel, Id::Save,
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -285,6 +286,7 @@ struct Win {
     caps: bool,
     /// автозапуск при входе — хранится не в config.json, а в реестре
     startup: bool,
+    updates: bool,
     ov_scale: f32,
     // вид
     expanded: bool,
@@ -360,6 +362,7 @@ fn make_win(
         space: cfg.append_space,
         caps: cfg.capitalize,
         startup: crate::startup::enabled(),
+        updates: cfg.check_updates,
         ov_scale: cfg.overlay_scale.clamp(0.6, 2.0),
         expanded: false,
         expand_t: 0.0,
@@ -465,6 +468,7 @@ pub fn open() {
             w.anim[Id::Space as usize] = w.space as u8 as f32;
             w.anim[Id::Caps as usize] = w.caps as u8 as f32;
             w.anim[Id::Startup as usize] = w.startup as u8 as f32;
+            w.anim[Id::Updates as usize] = w.updates as u8 as f32;
         });
 
         // разместить по центру рабочей области монитора под курсором
@@ -666,6 +670,7 @@ impl Win {
             (Id::Space, "Пробел после фразы"),
             (Id::Caps, "Заглавная в начале фразы"),
             (Id::Startup, "Запускать при входе в Windows"),
+            (Id::Updates, "Проверять обновления"),
         ] {
             let h = SW_H;
             items.push(Item { id, k: K::Toggle, x: W - PAD - SW_W, y: my, w: SW_W, h, more: true });
@@ -1196,10 +1201,11 @@ fn tick() {
                 Id::Space => w.space as u8 as f32,
                 Id::Caps => w.caps as u8 as f32,
                 Id::Startup => w.startup as u8 as f32,
+                Id::Updates => w.updates as u8 as f32,
                 _ => 0.0,
             };
             let dur = match id {
-                Id::Live | Id::Space | Id::Caps | Id::Startup => 0.30,
+                Id::Live | Id::Space | Id::Caps | Id::Startup | Id::Updates => 0.30,
                 _ => 0.25,
             };
             moving |= step(&mut w.anim[i], target, dur, dt);
@@ -1281,6 +1287,7 @@ fn activate(w: &mut Win, id: Id) -> Act {
         Id::Space => w.space = !w.space,
         Id::Caps => w.caps = !w.caps,
         Id::Startup => w.startup = !w.startup,
+        Id::Updates => w.updates = !w.updates,
         Id::More => w.expanded = !w.expanded,
         Id::Hotkey => start_capture(w),
         Id::Device => popup_toggle(w),
@@ -1352,6 +1359,7 @@ fn build_config(w: &Win) -> crate::config::Config {
     cfg.append_space = w.space;
     cfg.capitalize = w.caps;
     cfg.overlay_scale = w.ov_scale;
+    cfg.check_updates = w.updates;
     if let Ok(v) = w.silence.text().trim().parse::<f32>() {
         cfg.silence_timeout = v.clamp(0.0, 600.0);
     }
@@ -2163,6 +2171,8 @@ mod tests {
             w.anim[Id::Live as usize] = w.live as u8 as f32;
             w.anim[Id::Space as usize] = w.space as u8 as f32;
             w.anim[Id::Caps as usize] = w.caps as u8 as f32;
+            w.anim[Id::Startup as usize] = w.startup as u8 as f32;
+            w.anim[Id::Updates as usize] = w.updates as u8 as f32;
 
             let l = w.layout();
             w.panel_h = l.h;

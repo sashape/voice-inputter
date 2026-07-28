@@ -11,6 +11,7 @@
 mod audio;
 mod config;
 mod engine;
+mod http;
 mod icons;
 mod model;
 mod model_ui;
@@ -22,6 +23,7 @@ mod startup;
 mod stt;
 mod typer;
 mod ui;
+mod update;
 mod win_ui;
 
 use config::Config;

@@ -22,6 +22,10 @@ The default model is Russian, but any sherpa-onnx streaming model works (see
   word, the extra characters are erased with Backspace and retyped.
 - ⌨️ **Unicode input via `SendInput`** — Cyrillic/Latin typed directly, no
   clipboard, no keyboard-layout dependency.
+- 🔄 **Update check** — once a day the app asks GitHub for the latest release
+  and, if a newer version exists, shows a tray notification and a menu item that
+  opens the release page. Check only — nothing is downloaded or installed
+  behind your back; switch it off with "Проверять обновления" in the settings.
 - 📦 **Self-contained exe** — sherpa, onnxruntime and the CRT are linked
   statically: **no DLLs and no VC++ Redistributable required**. Distribution is
   just the exe + `config.json` + the model folder.
@@ -93,7 +97,7 @@ automatically (int8 variants preferred).
 Everything except `model_path` is editable in the Settings window (tray →
 "Настройки…", or the ⚙ button on the overlay); the rarely-changed knobs
 (`silence_timeout`, `hotwords_score`, `overlay_scale`, `append_space`,
-`capitalize`) live under "Дополнительно" there. Saving rewrites `config.json`
+`capitalize`, `check_updates`) live under "Дополнительно" there. Saving rewrites `config.json`
 and applies the change without a restart.
 
 If `config.json` is absent, built-in defaults are used. See
@@ -109,6 +113,7 @@ If `config.json` is absent, built-in defaults are used. See
   "hotkey": "ctrl+alt+space",        // ctrl/alt/shift/win + letter/digit/space/F1..F12
   "overlay_scale": 1.0,              // extra overlay size multiplier on top of DPI
   "live_typing": true,               // true = type as you speak; false = after a pause
+  "check_updates": true,             // daily check for a newer GitHub release
   "append_space": true,
   "capitalize": true
 }
@@ -131,6 +136,7 @@ If `config.json` is absent, built-in defaults are used. See
 | `model.rs` / `model_ui.rs` | Model download (WinHTTP + `tar.exe`) and the first-run window |
 | `win_ui.rs` | Shared window kit: palette, fonts, GDI text, layered surface |
 | `startup.rs` | "Run at Windows startup" toggle (`HKCU\...\Run`) |
+| `update.rs` / `http.rs` | Daily release check on GitHub / tiny WinHTTP client |
 | `paint.rs` | Shared drawing primitives (rounded rects, gradients, blur, easing) |
 | `icons.rs` | Tray icons from the design PNGs, `.ico` builder for the exe |
 | `shared.rs` / `config.rs` | Shared state / `config.json` |

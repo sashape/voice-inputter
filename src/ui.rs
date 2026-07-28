@@ -38,14 +38,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TRACKMOUSEEVENT, TME_LEAVE,
 };
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // ── константы ────────────────────────────────────────────────────────────
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_STATE: u32 = WM_APP + 2;
+const WM_APP_UPDATE: u32 = WM_APP + 3;
+/// Клик по всплывающему уведомлению трея.
+const NIN_BALLOONUSERCLICK: u32 = WM_USER + 5;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 const HOTKEY_ID: i32 = 1;
@@ -59,6 +62,7 @@ const ID_ENABLED: usize = 2;
 const ID_DICTATE: usize = 3;
 const ID_QUIT: usize = 4;
 const ID_MODEL: usize = 5;
+const ID_UPDATE: usize = 6;
 
 use overlay::{OV_H, OV_W};
 
@@ -145,6 +149,17 @@ pub fn post_state() {
                 WPARAM(0),
                 LPARAM(0),
             );
+        }
+    }
+}
+
+/// Уведомить UI о найденном обновлении (вызывается из потока проверки).
+pub fn post_update() {
+    let s = shared();
+    let h = unpack_hwnd(&s.main_hwnd, &s.main_hwnd_hi);
+    if h != 0 {
+        unsafe {
+            let _ = PostMessageW(HWND(h as *mut c_void), WM_APP_UPDATE, WPARAM(0), LPARAM(0));
         }
     }
 }
@@ -263,6 +278,9 @@ pub fn run() {
         // ускоряется до TIMER_FAST + timeBeginPeriod, когда становится виден
         SetTimer(main, OVERLAY_TIMER, TIMER_IDLE, None);
 
+        // проверка обновлений (первая — через полминуты после старта)
+        crate::update::watch();
+
         // первый запуск без модели — предлагаем скачать её сразу
         if !crate::model::installed() {
             crate::model_ui::open();
@@ -334,12 +352,23 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 match event {
                     WM_RBUTTONUP | WM_CONTEXTMENU => show_tray_menu(hwnd),
                     WM_LBUTTONUP => crate::shared::send_worker(WorkerMsg::Toggle),
+                    NIN_BALLOONUSERCLICK => open_release_page(),
                     _ => {}
                 }
                 LRESULT(0)
             }
             WM_APP_STATE => {
                 update_tray_icon(hwnd);
+                LRESULT(0)
+            }
+            WM_APP_UPDATE => {
+                if let Some(u) = crate::update::available() {
+                    show_balloon(
+                        hwnd,
+                        "Доступно обновление",
+                        &format!("Версия {} — откройте страницу релиза", u.version),
+                    );
+                }
                 LRESULT(0)
             }
             WM_HOTKEY => {
@@ -416,6 +445,36 @@ fn tray_data(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
     nid
 }
 
+/// Всплывающее уведомление у иконки в трее.
+fn show_balloon(hwnd: HWND, title: &str, text: &str) {
+    unsafe {
+        let mut nid = tray_data(hwnd, HICON::default());
+        nid.uFlags = NIF_INFO;
+        nid.dwInfoFlags = NIIF_INFO;
+        let put = |dst: &mut [u16], src: &str| {
+            let w = wide(src);
+            for (i, &c) in w.iter().take(dst.len()).enumerate() {
+                dst[i] = c;
+            }
+        };
+        put(&mut nid.szInfoTitle, title);
+        put(&mut nid.szInfo, text);
+        if !Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
+            eprintln!("[ui] уведомление трея не показано (Shell_NotifyIcon отказал)");
+        }
+    }
+}
+
+/// Открывает страницу релиза в браузере.
+fn open_release_page() {
+    let Some(u) = crate::update::available() else { return };
+    let url = wide(&u.url);
+    unsafe {
+        ShellExecuteW(HWND::default(), w!("open"), PCWSTR(url.as_ptr()), PCWSTR::null(),
+            PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
 fn add_tray(hwnd: HWND, icon: HICON) {
     unsafe {
         let nid = tray_data(hwnd, icon);
@@ -464,6 +523,17 @@ fn show_tray_menu(hwnd: HWND) {
         let en_label = wide("Прослушивание микрофона");
         AppendMenuW(menu, en_flags, ID_ENABLED, PCWSTR(en_label.as_ptr())).ok();
 
+        // пункт появляется, только когда проверка нашла новую версию
+        let upd = crate::update::available();
+        let upd_label = upd
+            .as_ref()
+            .map(|u| wide(&format!("Обновление {} — открыть…", u.version)))
+            .unwrap_or_default();
+        if upd.is_some() {
+            AppendMenuW(menu, MF_STRING, ID_UPDATE, PCWSTR(upd_label.as_ptr())).ok();
+            AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()).ok();
+        }
+
         let set_label = wide("Настройки…");
         AppendMenuW(menu, MF_STRING, ID_SETTINGS, PCWSTR(set_label.as_ptr())).ok();
 
@@ -496,6 +566,7 @@ fn show_tray_menu(hwnd: HWND) {
             ID_ENABLED => crate::shared::send_worker(WorkerMsg::SetEnabled(!is_enabled())),
             ID_SETTINGS => open_settings(),
             ID_MODEL => crate::model_ui::open(),
+            ID_UPDATE => open_release_page(),
             ID_QUIT => {
                 DestroyWindow(hwnd).ok();
             }

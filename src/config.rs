@@ -27,6 +27,9 @@ pub struct Config {
     /// Режим показа оверлея: "always" | "dictation" | "hidden".
     #[serde(default = "default_overlay_mode")]
     pub overlay_mode: String,
+    /// Проверять обновления на GitHub (раз в сутки, только проверка).
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
     /// Контекстное усиление wake/stop-слов (0 = выкл/greedy; >0 = beam-search).
     #[serde(default = "default_hotwords_score")]
     pub hotwords_score: f32,
@@ -48,6 +51,7 @@ impl Default for Config {
             overlay_scale: default_scale(),
             live_typing: true,
             overlay_mode: default_overlay_mode(),
+            check_updates: true,
             hotwords_score: default_hotwords_score(),
             append_space: true,
             capitalize: true,
