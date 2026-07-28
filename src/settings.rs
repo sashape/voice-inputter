@@ -65,6 +65,12 @@ const SH_L: f32 = 0.0;
 const SH_T: f32 = 0.0;
 const SH_B: f32 = 0.0;
 
+/// Выше этого окно не растёт — дальше контент прокручивается.
+const MAX_H: f32 = 1000.0;
+/// Ширина полосы прокрутки и её отступ от правого края.
+const BAR_W: f32 = 4.0;
+const BAR_PAD: f32 = 6.0;
+
 const TIMER: usize = 7;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -88,14 +94,17 @@ enum Id {
     Caps,
     Startup,
     Updates,
+    Punct,
+    Prefix,
+    Bar,
     Cancel,
     Save,
 }
-const N_ID: usize = 19;
+const N_ID: usize = 22;
 const ALL_IDS: [Id; N_ID] = [
     Id::Close, Id::Device, Id::Wake, Id::Stop, Id::Hotkey, Id::Mode0, Id::Mode1, Id::Mode2,
     Id::Live, Id::More, Id::Silence, Id::OvScale, Id::Hotwords, Id::Space, Id::Caps, Id::Startup,
-    Id::Updates, Id::Cancel, Id::Save,
+    Id::Updates, Id::Punct, Id::Prefix, Id::Bar, Id::Cancel, Id::Save,
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -108,6 +117,8 @@ enum K {
     Btn,
     Slider,
     More,
+    /// ползунок полосы прокрутки
+    Bar,
 }
 
 #[derive(Clone, Copy)]
@@ -120,6 +131,8 @@ struct Item {
     h: f32,
     /// элемент лежит в раскрывающемся блоке «Дополнительно» (клипается)
     more: bool,
+    /// шапка и кнопки не прокручиваются вместе с контентом
+    fixed: bool,
 }
 
 impl Item {
@@ -148,6 +161,7 @@ struct Lab {
     sp: f32,
     max_w: f32,
     more: bool,
+    fixed: bool,
 }
 
 // ── однострочное поле ввода ───────────────────────────────────────────────
@@ -278,6 +292,7 @@ struct Win {
     stop: Edit,
     silence: Edit,
     hotwords: Edit,
+    prefix: Edit,
     hotkey: String,
     capturing: bool,
     mode: usize,
@@ -287,10 +302,16 @@ struct Win {
     /// автозапуск при входе — хранится не в config.json, а в реестре
     startup: bool,
     updates: bool,
+    punct: bool,
     ov_scale: f32,
     // вид
     expanded: bool,
     expand_t: f32,
+    /// прокрутка контента (лог. px) и захват ползунка мышью
+    scroll: f32,
+    drag_bar: Option<f32>,
+    /// предельная высота панели: 1000 px, но не выше рабочей области
+    max_h: f32,
     focus: Option<Id>,
     hot: Option<Id>,
     press: Option<Id>,
@@ -320,8 +341,11 @@ thread_local! {
     static ST: RefCell<Option<Box<Win>>> = const { RefCell::new(None) };
 }
 
+/// Доступ к состоянию окна. try_borrow: Windows синхронно шлёт сообщения из
+/// ShowWindow/SetWindowPos, и обработчик может попасть сюда, пока состояние
+/// занято — тогда пропускаем шаг вместо паники (паника из wndproc = abort).
 fn with<R>(f: impl FnOnce(&mut Win) -> R) -> Option<R> {
-    ST.with(|s| s.borrow_mut().as_mut().map(|w| f(w)))
+    ST.with(|s| s.try_borrow_mut().ok().and_then(|mut b| b.as_mut().map(|w| f(w))))
 }
 
 /// Собирает состояние окна из конфига (вынесено, чтобы им же пользовался
@@ -351,6 +375,7 @@ fn make_win(
         stop: Edit::new(&cfg.stop_words.join(", "), false),
         silence: Edit::new(&fmt_num(cfg.silence_timeout), true),
         hotwords: Edit::new(&fmt_num(cfg.hotwords_score), true),
+        prefix: Edit::new(&cfg.punctuation_prefix, false),
         hotkey: cfg.hotkey.clone(),
         capturing: false,
         mode: match cfg.overlay_mode.as_str() {
@@ -363,9 +388,13 @@ fn make_win(
         caps: cfg.capitalize,
         startup: crate::startup::enabled(),
         updates: cfg.check_updates,
+        punct: cfg.punctuation,
         ov_scale: cfg.overlay_scale.clamp(0.6, 2.0),
         expanded: false,
         expand_t: 0.0,
+        scroll: 0.0,
+        drag_bar: None,
+        max_h: MAX_H,
         focus: None,
         hot: None,
         press: None,
@@ -469,16 +498,20 @@ pub fn open() {
             w.anim[Id::Caps as usize] = w.caps as u8 as f32;
             w.anim[Id::Startup as usize] = w.startup as u8 as f32;
             w.anim[Id::Updates as usize] = w.updates as u8 as f32;
+            w.anim[Id::Punct as usize] = w.punct as u8 as f32;
         });
 
         // разместить по центру рабочей области монитора под курсором
-        with(|w| {
-            let l = w.layout();
-            w.panel_h = l.h;
-        });
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let wa = work_area(pt);
+        with(|w| {
+            // окно не должно быть выше экрана — иначе кнопки уедут за край
+            let avail = (wa.bottom - wa.top) as f32 / w.scale - 48.0;
+            w.max_h = MAX_H.min(avail.max(320.0));
+            let l = w.layout();
+            w.panel_h = l.h;
+        });
         let (sw, sh) = with(|w| surface_size(w)).unwrap_or((400, 700));
         let x = wa.left + (wa.right - wa.left - sw) / 2;
         let y = wa.top + (wa.bottom - wa.top - sh) / 2;
@@ -547,9 +580,11 @@ unsafe fn register_classes(hinstance: windows::Win32::Foundation::HINSTANCE) {
 struct Layout {
     items: Vec<Item>,
     labs: Vec<Lab>,
-    divs: Vec<f32>,   // y горизонтальных разделителей
-    h: f32,           // высота панели
-    band: (f32, f32), // видимая полоса блока «Дополнительно» (y0, y1)
+    divs: Vec<f32>,    // y горизонтальных разделителей
+    h: f32,            // высота панели
+    band: (f32, f32),  // видимая полоса блока «Дополнительно» (y0, y1)
+    view: (f32, f32),  // окно прокрутки: между шапкой и кнопками
+    max_scroll: f32,   // насколько контент выше окна прокрутки
 }
 
 impl Win {
@@ -562,20 +597,24 @@ impl Win {
         let mut labs = Vec::with_capacity(24);
         macro_rules! lab {
             ($s:expr, $f:expr, $x:expr, $cy:expr, $al:expr, $c:expr, $sp:expr, $max:expr) => {
-                labs.push(Lab { s: $s.to_string(), f: $f, x: $x, cy: $cy, al: $al, c: $c, sp: $sp, max_w: $max, more: false })
+                lab!($s, $f, $x, $cy, $al, $c, $sp, $max, false)
+            };
+            ($s:expr, $f:expr, $x:expr, $cy:expr, $al:expr, $c:expr, $sp:expr, $max:expr, $fx:expr) => {
+                labs.push(Lab { s: $s.to_string(), f: $f, x: $x, cy: $cy, al: $al, c: $c, sp: $sp, max_w: $max, more: false, fixed: $fx })
             };
         }
 
-        // ── шапка
-        items.push(Item { id: Id::Close, k: K::Icon, x: W - 18.0 - 28.0, y: 16.0, w: 28.0, h: 28.0, more: false });
-        lab!("Voice Inputter — Настройки", F::Title, 58.0, 30.0, Al::L, TXT, 0.14, 260.0);
+        // ── шапка (не прокручивается)
+        items.push(Item { id: Id::Close, k: K::Icon, x: W - 18.0 - 28.0, y: 16.0, w: 28.0, h: 28.0, more: false, fixed: true });
+        lab!("Voice Inputter — Настройки", F::Title, 58.0, 30.0, Al::L, TXT, 0.14, 260.0, true);
 
-        let mut y = TITLE_H + 6.0;
+        let top = TITLE_H + 6.0;
+        let mut y = top - self.scroll;
 
         // ── микрофон
         lab!("Микрофон", F::Label, PAD, y + L_LABEL / 2.0, Al::L, TXT_DIM, 0.36, CW);
         y += L_LABEL + GAP_S;
-        items.push(Item { id: Id::Device, k: K::Select, x: PAD, y, w: CW, h: FIELD_H, more: false });
+        items.push(Item { id: Id::Device, k: K::Select, x: PAD, y, w: CW, h: FIELD_H, more: false, fixed: false });
         let dev = if self.device == 0 {
             "По умолчанию".to_string()
         } else {
@@ -587,7 +626,7 @@ impl Win {
         // ── имя-активатор
         lab!("Имя-активатор", F::Label, PAD, y + L_LABEL / 2.0, Al::L, TXT_DIM, 0.36, CW);
         y += L_LABEL + GAP_S;
-        items.push(Item { id: Id::Wake, k: K::Edit, x: PAD, y, w: CW, h: FIELD_H, more: false });
+        items.push(Item { id: Id::Wake, k: K::Edit, x: PAD, y, w: CW, h: FIELD_H, more: false, fixed: false });
         y += FIELD_H + GAP_S;
         lab!("Несколько слов — через запятую", F::Hint, PAD, y + L_HINT / 2.0, Al::L, TXT_MUTE, 0.0, CW);
         y += L_HINT + GAP;
@@ -595,14 +634,14 @@ impl Win {
         // ── стоп-слова
         lab!("Стоп-слова", F::Label, PAD, y + L_LABEL / 2.0, Al::L, TXT_DIM, 0.36, CW);
         y += L_LABEL + GAP_S;
-        items.push(Item { id: Id::Stop, k: K::Edit, x: PAD, y, w: CW, h: FIELD_H, more: false });
+        items.push(Item { id: Id::Stop, k: K::Edit, x: PAD, y, w: CW, h: FIELD_H, more: false, fixed: false });
         y += FIELD_H + GAP;
 
         // ── горячая клавиша
         let hk_txt = if self.capturing { "Нажмите клавиши…".to_string() } else { hotkey_label(&self.hotkey) };
         let hk_w = (self.text_w(F::Seg, &hk_txt) / self.scale + 28.0).max(86.0);
         let row_h = 36.0f32;
-        items.push(Item { id: Id::Hotkey, k: K::Btn, x: W - PAD - hk_w, y, w: hk_w, h: row_h, more: false });
+        items.push(Item { id: Id::Hotkey, k: K::Btn, x: W - PAD - hk_w, y, w: hk_w, h: row_h, more: false, fixed: false });
         lab!("Горячая клавиша", F::Label, PAD, y + row_h / 2.0 - 9.0, Al::L, TXT_DIM, 0.36, 240.0);
         lab!("Нажмите и введите сочетание", F::Hint, PAD, y + row_h / 2.0 + 8.0, Al::L, TXT_MUTE, 0.0, 240.0);
         let hk_col = if self.capturing { WHITE } else { ICON };
@@ -620,7 +659,7 @@ impl Win {
         let seg_w = (CW - 8.0 - 8.0) / 3.0; // паддинг 4 + 2 зазора по 4
         for (i, id) in [Id::Mode0, Id::Mode1, Id::Mode2].iter().enumerate() {
             let x = PAD + 4.0 + i as f32 * (seg_w + 4.0);
-            items.push(Item { id: *id, k: K::Seg, x, y: seg_y, w: seg_w, h: SEG_H, more: false });
+            items.push(Item { id: *id, k: K::Seg, x, y: seg_y, w: seg_w, h: SEG_H, more: false, fixed: false });
             let t = self.anim[*id as usize];
             lab!(self.seg_label(i), F::Seg, x + seg_w / 2.0, seg_y + SEG_H / 2.0, Al::C, lerp(TXT_GREY, WHITE, t), 0.0, seg_w);
         }
@@ -628,7 +667,7 @@ impl Win {
 
         // ── печатать сразу
         let live_h = 33.0f32;
-        items.push(Item { id: Id::Live, k: K::Toggle, x: W - PAD - SW_W, y: y + (live_h - SW_H) / 2.0, w: SW_W, h: SW_H, more: false });
+        items.push(Item { id: Id::Live, k: K::Toggle, x: W - PAD - SW_W, y: y + (live_h - SW_H) / 2.0, w: SW_W, h: SW_H, more: false, fixed: false });
         lab!("Печатать сразу, по мере речи", F::Body, PAD, y + 8.0, Al::L, TXT, 0.0, 290.0);
         lab!("Текст появляется во время диктовки, а не после", F::Hint, PAD, y + 8.0 + L_BODY / 2.0 + 3.0 + L_HINT / 2.0, Al::L, TXT_MUTE, 0.0, 290.0);
         y += live_h + GAP;
@@ -637,7 +676,7 @@ impl Win {
         let div2 = y;
         y += 1.0 + GAP;
         let more_row = 18.0f32;
-        items.push(Item { id: Id::More, k: K::More, x: PAD, y, w: CW, h: more_row, more: false });
+        items.push(Item { id: Id::More, k: K::More, x: PAD, y, w: CW, h: more_row, more: false, fixed: false });
         lab!("Дополнительно", F::Label, PAD + 20.0, y + more_row / 2.0, Al::L, lerp(TXT_DIM, TXT, self.anim[Id::More as usize]), 0.36, 260.0);
         y += more_row;
 
@@ -648,9 +687,9 @@ impl Win {
             let num_row = |items: &mut Vec<Item>, labs: &mut Vec<Lab>, id: Id, title: &str, hint: &str, y: f32| -> f32 {
                 let h = 36.0f32;
                 let fw = 96.0f32;
-                items.push(Item { id, k: K::Edit, x: W - PAD - fw, y, w: fw, h, more: true });
-                labs.push(Lab { s: title.into(), f: F::Body, x: PAD, cy: y + h / 2.0 - 8.0, al: Al::L, c: TXT, sp: 0.0, max_w: 240.0, more: true });
-                labs.push(Lab { s: hint.into(), f: F::Hint, x: PAD, cy: y + h / 2.0 + 9.0, al: Al::L, c: TXT_MUTE, sp: 0.0, max_w: 240.0, more: true });
+                items.push(Item { id, k: K::Edit, x: W - PAD - fw, y, w: fw, h, more: true, fixed: false });
+                labs.push(Lab { s: title.into(), f: F::Body, x: PAD, cy: y + h / 2.0 - 8.0, al: Al::L, c: TXT, sp: 0.0, max_w: 240.0, more: true, fixed: false });
+                labs.push(Lab { s: hint.into(), f: F::Hint, x: PAD, cy: y + h / 2.0 + 9.0, al: Al::L, c: TXT_MUTE, sp: 0.0, max_w: 240.0, more: true, fixed: false });
                 y + h + MORE_GAP
             };
             my = num_row(&mut items, &mut labs, Id::Silence, "Пауза до авто-стопа", "секунд тишины; 0 — не выключать", my);
@@ -660,12 +699,26 @@ impl Win {
         {
             let h = 36.0f32;
             let slw = 150.0f32;
-            items.push(Item { id: Id::OvScale, k: K::Slider, x: W - PAD - slw, y: my, w: slw, h, more: true });
-            labs.push(Lab { s: "Размер оверлея".into(), f: F::Body, x: PAD, cy: my + h / 2.0 - 8.0, al: Al::L, c: TXT, sp: 0.0, max_w: 200.0, more: true });
-            labs.push(Lab { s: format!("×{:.2}", self.ov_scale), f: F::Hint, x: PAD, cy: my + h / 2.0 + 9.0, al: Al::L, c: TXT_MUTE, sp: 0.0, max_w: 200.0, more: true });
+            items.push(Item { id: Id::OvScale, k: K::Slider, x: W - PAD - slw, y: my, w: slw, h, more: true, fixed: false });
+            labs.push(Lab { s: "Размер оверлея".into(), f: F::Body, x: PAD, cy: my + h / 2.0 - 8.0, al: Al::L, c: TXT, sp: 0.0, max_w: 200.0, more: true, fixed: false });
+            labs.push(Lab { s: format!("×{:.2}", self.ov_scale), f: F::Hint, x: PAD, cy: my + h / 2.0 + 9.0, al: Al::L, c: TXT_MUTE, sp: 0.0, max_w: 200.0, more: true, fixed: false });
             my += h + MORE_GAP;
         }
-        // два переключателя
+        // переключатель пунктуации, затем поле приставки, затем остальные
+        for (id, title) in [(Id::Punct, "Знаки препинания голосом")] {
+            let h = SW_H;
+            items.push(Item { id, k: K::Toggle, x: W - PAD - SW_W, y: my, w: SW_W, h, more: true, fixed: false });
+            labs.push(Lab { s: title.into(), f: F::Body, x: PAD, cy: my + h / 2.0, al: Al::L, c: TXT, sp: 0.0, max_w: 280.0, more: true, fixed: false });
+            my += h + MORE_GAP;
+        }
+        {
+            let h = 36.0f32;
+            let fw = 140.0f32;
+            items.push(Item { id: Id::Prefix, k: K::Edit, x: W - PAD - fw, y: my, w: fw, h, more: true, fixed: false });
+            labs.push(Lab { s: "Слово-приставка для знаков".into(), f: F::Body, x: PAD, cy: my + h / 2.0 - 8.0, al: Al::L, c: TXT, sp: 0.0, max_w: 200.0, more: true, fixed: false });
+            labs.push(Lab { s: "пусто — знак ставится сразу".into(), f: F::Hint, x: PAD, cy: my + h / 2.0 + 9.0, al: Al::L, c: TXT_MUTE, sp: 0.0, max_w: 200.0, more: true, fixed: false });
+            my += h + MORE_GAP;
+        }
         for (id, title) in [
             (Id::Space, "Пробел после фразы"),
             (Id::Caps, "Заглавная в начале фразы"),
@@ -673,8 +726,8 @@ impl Win {
             (Id::Updates, "Проверять обновления"),
         ] {
             let h = SW_H;
-            items.push(Item { id, k: K::Toggle, x: W - PAD - SW_W, y: my, w: SW_W, h, more: true });
-            labs.push(Lab { s: title.into(), f: F::Body, x: PAD, cy: my + h / 2.0, al: Al::L, c: TXT, sp: 0.0, max_w: 280.0, more: true });
+            items.push(Item { id, k: K::Toggle, x: W - PAD - SW_W, y: my, w: SW_W, h, more: true, fixed: false });
+            labs.push(Lab { s: title.into(), f: F::Body, x: PAD, cy: my + h / 2.0, al: Al::L, c: TXT, sp: 0.0, max_w: 280.0, more: true, fixed: false });
             my += h + MORE_GAP;
         }
         let more_full = my - inner_top; // полная высота содержимого блока
@@ -682,20 +735,45 @@ impl Win {
         y += more_h;
         let band = (inner_top, inner_top + more_h);
 
-        // ── кнопки
-        y += GAP + 4.0;
+        // высота контента (в несмещённых координатах) и размеры панели
+        let content_h = y - (top - self.scroll);
+        let footer_h = GAP + 4.0 + BTN_H + PAD;
+        let full = top + content_h + footer_h;
+        let panel_h = full.min(self.max_h);
+        let view = (TITLE_H, panel_h - footer_h);
+        let max_scroll = (full - panel_h).max(0.0);
+
+        // ── кнопки (прижаты к низу панели, не прокручиваются)
+        let by = panel_h - PAD - BTN_H;
         let save_w = (self.text_w(F::BtnBold, "Сохранить") / self.scale + 44.0).round();
         let cancel_w = (self.text_w(F::Btn, "Отмена") / self.scale + 36.0).round();
         let save_x = W - PAD - save_w;
         let cancel_x = save_x - 10.0 - cancel_w;
-        items.push(Item { id: Id::Cancel, k: K::Btn, x: cancel_x, y, w: cancel_w, h: BTN_H, more: false });
-        items.push(Item { id: Id::Save, k: K::Btn, x: save_x, y, w: save_w, h: BTN_H, more: false });
+        items.push(Item { id: Id::Cancel, k: K::Btn, x: cancel_x, y: by, w: cancel_w, h: BTN_H, more: false, fixed: true });
+        items.push(Item { id: Id::Save, k: K::Btn, x: save_x, y: by, w: save_w, h: BTN_H, more: false, fixed: true });
         let cancel_c = lerp(TXT_DIM, TXT, self.anim[Id::Cancel as usize]);
-        lab!("Отмена", F::Btn, cancel_x + cancel_w / 2.0, y + BTN_H / 2.0, Al::C, cancel_c, 0.0, cancel_w);
-        lab!("Сохранить", F::BtnBold, save_x + save_w / 2.0, y + BTN_H / 2.0, Al::C, WHITE, 0.0, save_w);
-        y += BTN_H + PAD;
+        lab!("Отмена", F::Btn, cancel_x + cancel_w / 2.0, by + BTN_H / 2.0, Al::C, cancel_c, 0.0, cancel_w, true);
+        lab!("Сохранить", F::BtnBold, save_x + save_w / 2.0, by + BTN_H / 2.0, Al::C, WHITE, 0.0, save_w, true);
 
-        Layout { items, labs, divs: vec![div1, div2], h: y, band }
+        // ── ползунок полосы прокрутки
+        if max_scroll > 0.5 {
+            let vh = view.1 - view.0;
+            let th = (vh * vh / (vh + max_scroll)).max(36.0);
+            let t = (self.scroll / max_scroll).clamp(0.0, 1.0);
+            let ty = view.0 + (vh - th) * t;
+            items.push(Item {
+                id: Id::Bar,
+                k: K::Bar,
+                x: W - BAR_PAD - BAR_W,
+                y: ty,
+                w: BAR_W,
+                h: th,
+                more: false,
+                fixed: true,
+            });
+        }
+
+        Layout { items, labs, divs: vec![div1, div2], h: panel_h, band, view, max_scroll }
     }
 
     /// Ширина текста в физических px.
@@ -710,6 +788,7 @@ impl Win {
             Id::Stop => Some(&self.stop),
             Id::Silence => Some(&self.silence),
             Id::Hotwords => Some(&self.hotwords),
+            Id::Prefix => Some(&self.prefix),
             _ => None,
         }
     }
@@ -720,6 +799,7 @@ impl Win {
             Id::Stop => Some(&mut self.stop),
             Id::Silence => Some(&mut self.silence),
             Id::Hotwords => Some(&mut self.hotwords),
+            Id::Prefix => Some(&mut self.prefix),
             _ => None,
         }
     }
@@ -844,6 +924,20 @@ impl Win {
             pm.stroke_path(&panel, &p, &st, Transform::identity(), None);
         }
 
+        // маска окна прокрутки: контент не залезает на шапку и кнопки
+        let view_mask = if l.max_scroll > 0.5 {
+            let mut m = tiny_skia::Mask::new(pm.width(), pm.height()).unwrap();
+            m.fill_path(
+                &round_rect(sp.x(0.0), sp.y(l.view.0), sp.l(W), sp.l(l.view.1 - l.view.0), 0.0),
+                FillRule::Winding,
+                false,
+                Transform::identity(),
+            );
+            Some(m)
+        } else {
+            None
+        };
+
         // маска блока «Дополнительно» (полоса раскрытия)
         let band_h = l.band.1 - l.band.0;
         let band_mask = if band_h > 0.5 {
@@ -869,6 +963,9 @@ impl Win {
 
         // разделители: linear-gradient(90deg, transparent, rgba(255,255,255,.08) 20%..80%, transparent)
         for &dy in &l.divs {
+            if dy < l.view.0 || dy > l.view.1 {
+                continue;
+            }
             let path = round_rect(sp.x(PAD), sp.y(dy), sp.l(CW), s.max(1.0), 0.0);
             fill(&mut pm, &path,
                 lin(sp.x(PAD), 0.0, sp.x(PAD + CW), 0.0,
@@ -880,7 +977,17 @@ impl Win {
             if it.more && (it.y + it.h <= l.band.0 || it.y >= l.band.1) {
                 continue;
             }
-            let mask = if it.more { band_mask.as_ref() } else { None };
+            // прокручиваемый элемент за пределами окна не рисуем
+            if !it.fixed && (it.y + it.h <= l.view.0 || it.y >= l.view.1) {
+                continue;
+            }
+            let mask = if it.more {
+                band_mask.as_ref()
+            } else if it.fixed {
+                None
+            } else {
+                view_mask.as_ref()
+            };
             let hov = self.hov(it.id);
             let act = self.anim[it.id as usize];
             let focused = self.focus == Some(it.id);
@@ -907,6 +1014,14 @@ impl Win {
                     }
                 }
                 K::Btn => self.draw_button(&mut pm, sp, it, hov, focused),
+                K::Bar => {
+                    // дорожка во всю высоту окна прокрутки и сам ползунок
+                    let track = sp.rr(it.x, l.view.0 + 4.0, it.w, l.view.1 - l.view.0 - 8.0, it.w / 2.0);
+                    fill_c(&mut pm, &track, WHITE, 0.05, None);
+                    let thumb = sp.rr(it.x, it.y, it.w, it.h, it.w / 2.0);
+                    let a = if self.drag_bar.is_some() { 0.38 } else { lerp_f(0.18, 0.3, hov) };
+                    fill_c(&mut pm, &thumb, WHITE, a, None);
+                }
             }
         }
 
@@ -1098,6 +1213,14 @@ impl Win {
     unsafe fn draw_text(&self, l: &Layout, sp: Sp) {
         let dc = self.dc;
         for lb in &l.labs {
+            if !lb.fixed {
+                if lb.cy < l.view.0 - 12.0 || lb.cy > l.view.1 + 12.0 {
+                    continue;
+                }
+                if l.max_scroll > 0.5 {
+                    clip(dc, sp, 0.0, l.view.0, W, l.view.1 - l.view.0);
+                }
+            }
             if lb.more {
                 let band_h = l.band.1 - l.band.0;
                 if band_h <= 0.5 || lb.cy < l.band.0 - 12.0 || lb.cy > l.band.1 + 12.0 {
@@ -1113,13 +1236,17 @@ impl Win {
                 Al::C => sp.x(lb.x) - tw / 2.0,
             };
             self.text_out(dc, lb.f, &t, x, sp.y(lb.cy), lb.c, sp.l(lb.sp));
-            if lb.more {
-                let _ = SelectClipRgn(dc, None);
-            }
+            let _ = SelectClipRgn(dc, None);
         }
         // текст в полях ввода
         for it in l.items.iter().filter(|i| i.k == K::Edit) {
             let Some(e) = self.edit(it.id) else { continue };
+            if !it.fixed && (it.y + it.h <= l.view.0 || it.y >= l.view.1) {
+                continue;
+            }
+            if !it.fixed && l.max_scroll > 0.5 {
+                clip(dc, sp, 0.0, l.view.0, W, l.view.1 - l.view.0);
+            }
             if it.more {
                 let band_h = l.band.1 - l.band.0;
                 if band_h <= 0.5 || it.y + it.h <= l.band.0 || it.y >= l.band.1 {
@@ -1149,6 +1276,12 @@ impl Win {
 // ── поверхность и цикл перерисовки ────────────────────────────────────────
 fn redraw() {
     with(|w| {
+        // прокрутку держим в границах: контент мог сжаться (свернули «Дополнительно»)
+        let probe = w.layout();
+        let clamped = w.scroll.clamp(0.0, probe.max_scroll);
+        if (clamped - w.scroll).abs() > 0.01 {
+            w.scroll = clamped;
+        }
         let l = w.layout();
         let resized = (l.h - w.panel_h).abs() > 0.01;
         w.panel_h = l.h;
@@ -1202,10 +1335,11 @@ fn tick() {
                 Id::Caps => w.caps as u8 as f32,
                 Id::Startup => w.startup as u8 as f32,
                 Id::Updates => w.updates as u8 as f32,
+                Id::Punct => w.punct as u8 as f32,
                 _ => 0.0,
             };
             let dur = match id {
-                Id::Live | Id::Space | Id::Caps | Id::Startup | Id::Updates => 0.30,
+                Id::Live | Id::Space | Id::Caps | Id::Startup | Id::Updates | Id::Punct => 0.30,
                 _ => 0.25,
             };
             moving |= step(&mut w.anim[i], target, dur, dt);
@@ -1253,6 +1387,13 @@ fn hit(w: &Win, lx: f32, ly: f32) -> Option<Item> {
             if it.more && (it.y + it.h <= l.band.0 || it.y >= l.band.1) {
                 return false;
             }
+            if !it.fixed && (it.y + it.h <= l.view.0 || it.y >= l.view.1) {
+                return false;
+            }
+            // по ползунку попадаем с запасом — он узкий
+            if it.k == K::Bar {
+                return lx >= it.x - 6.0 && lx <= it.x + it.w + 6.0 && ly >= it.y && ly <= it.y + it.h;
+            }
             it.hit(lx, ly)
         })
         .copied()
@@ -1261,7 +1402,7 @@ fn hit(w: &Win, lx: f32, ly: f32) -> Option<Item> {
 fn focusables(l: &Layout) -> Vec<Id> {
     l.items
         .iter()
-        .filter(|it| it.k != K::Icon && !(it.more && it.y >= l.band.1))
+        .filter(|it| it.k != K::Icon && it.k != K::Bar && !(it.more && it.y >= l.band.1))
         .map(|it| it.id)
         .collect()
 }
@@ -1288,6 +1429,7 @@ fn activate(w: &mut Win, id: Id) -> Act {
         Id::Caps => w.caps = !w.caps,
         Id::Startup => w.startup = !w.startup,
         Id::Updates => w.updates = !w.updates,
+        Id::Punct => w.punct = !w.punct,
         Id::More => w.expanded = !w.expanded,
         Id::Hotkey => start_capture(w),
         Id::Device => popup_toggle(w),
@@ -1360,6 +1502,8 @@ fn build_config(w: &Win) -> crate::config::Config {
     cfg.capitalize = w.caps;
     cfg.overlay_scale = w.ov_scale;
     cfg.check_updates = w.updates;
+    cfg.punctuation = w.punct;
+    cfg.punctuation_prefix = w.prefix.text().trim().to_lowercase();
     if let Ok(v) = w.silence.text().trim().parse::<f32>() {
         cfg.silence_timeout = v.clamp(0.0, 600.0);
     }
@@ -1556,7 +1700,19 @@ fn popup_scroll(w: &mut Win, delta: i32) {
     popup_draw(w);
 }
 
+/// Оконная процедура: паника внутри неё обрывала бы процесс (unwind
+/// через FFI → abort), поэтому ловим её и продолжаем работать.
 extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        popup_wndproc_inner(hwnd, msg, wp, lp)
+    }));
+    match r {
+        Ok(v) => v,
+        Err(_) => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_MOUSEMOVE => {
@@ -1641,7 +1797,19 @@ fn key_down(vk: u32) -> bool {
 }
 
 // ── оконная процедура ─────────────────────────────────────────────────────
+/// Оконная процедура: паника внутри неё обрывала бы процесс (unwind
+/// через FFI → abort), поэтому ловим её и продолжаем работать.
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wndproc_inner(hwnd, msg, wp, lp)
+    }));
+    match r {
+        Ok(v) => v,
+        Err(_) => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+fn wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_TIMER => {
@@ -1674,7 +1842,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 let (x, y) = (lo(lp), hi(lp));
                 with(|w| {
                     let (lx, ly) = to_panel(w, x, y);
-                    if w.drag_edit {
+                    if let Some(grab) = w.drag_bar {
+                        let l = w.layout();
+                        let vh = l.view.1 - l.view.0;
+                        let th = l.items.iter().find(|i| i.k == K::Bar).map(|i| i.h).unwrap_or(36.0);
+                        let span = (vh - th).max(1.0);
+                        let t = ((ly - grab - l.view.0) / span).clamp(0.0, 1.0);
+                        w.scroll = t * l.max_scroll;
+                        w.dirty = true;
+                    } else if w.drag_edit {
                         if let Some(id) = w.focus {
                             let l = w.layout();
                             if let Some(it) = l.items.iter().find(|i| i.id == id).copied() {
@@ -1755,6 +1931,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                             w.caret_at = Instant::now();
                             SetCapture(hwnd);
                         }
+                        Some(it) if it.k == K::Bar => {
+                            w.drag_bar = Some(ly - it.y);
+                            SetCapture(hwnd);
+                        }
                         Some(it) if it.k == K::Slider => {
                             w.focus = Some(it.id);
                             set_slider(w, &it, lx);
@@ -1782,6 +1962,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     let _ = ReleaseCapture();
                     w.drag_edit = false;
                     w.drag_slider = false;
+                    w.drag_bar = None;
                     let (lx, ly) = to_panel(w, x, y);
                     let it = hit(w, lx, ly);
                     let press = w.press.take();
@@ -1800,6 +1981,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 with(|w| {
                     if w.popup_on {
                         popup_scroll(w, d);
+                        return;
+                    }
+                    let max = w.layout().max_scroll;
+                    if max > 0.0 {
+                        w.scroll = (w.scroll - d as f32 * 60.0).clamp(0.0, max);
+                        w.dirty = true;
                     }
                 });
                 LRESULT(0)
@@ -1910,6 +2097,27 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
     }
 }
 
+/// Подкручивает контент так, чтобы элемент с фокусом был виден целиком.
+fn scroll_into_view(w: &mut Win, id: Id) {
+    let l = w.layout();
+    if l.max_scroll <= 0.0 {
+        return;
+    }
+    let Some(it) = l.items.iter().find(|i| i.id == id && !i.fixed).copied() else { return };
+    let pad = 8.0;
+    let delta = if it.y - pad < l.view.0 {
+        it.y - pad - l.view.0
+    } else if it.y + it.h + pad > l.view.1 {
+        it.y + it.h + pad - l.view.1
+    } else {
+        0.0
+    };
+    if delta != 0.0 {
+        w.scroll = (w.scroll + delta).clamp(0.0, l.max_scroll);
+        w.dirty = true;
+    }
+}
+
 fn set_slider(w: &mut Win, it: &Item, lx: f32) {
     let (x0, x1) = (it.x + 8.0, it.x + it.w - 8.0);
     let t = ((lx - x0) / (x1 - x0)).clamp(0.0, 1.0);
@@ -1970,6 +2178,7 @@ fn on_key(w: &mut Win, vk: u32) -> Act {
             if let Some(e) = w.edit_mut(f[next]) {
                 e.select_all();
             }
+            scroll_into_view(w, f[next]);
             return Act::None;
         }
         VK_SPACE => {
@@ -2165,6 +2374,7 @@ mod tests {
             let mut w = make_win(HWND::default(), HWND::default(), dc, pdc, scale, &cfg, devices, 1);
             w.expanded = more;
             w.expand_t = more as u8 as f32;
+            w.scroll = std::env::var("SETTINGS_SCROLL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
             for (i, id) in [Id::Mode0, Id::Mode1, Id::Mode2].iter().enumerate() {
                 w.anim[*id as usize] = (w.mode == i) as u8 as f32;
             }
@@ -2173,6 +2383,7 @@ mod tests {
             w.anim[Id::Caps as usize] = w.caps as u8 as f32;
             w.anim[Id::Startup as usize] = w.startup as u8 as f32;
             w.anim[Id::Updates as usize] = w.updates as u8 as f32;
+            w.anim[Id::Punct as usize] = w.punct as u8 as f32;
 
             let l = w.layout();
             w.panel_h = l.h;

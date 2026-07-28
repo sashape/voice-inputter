@@ -65,8 +65,10 @@ thread_local! {
     static DLG: RefCell<Option<Box<Dlg>>> = const { RefCell::new(None) };
 }
 
+/// Доступ к состоянию окна (см. пояснение в settings.rs): try_borrow, чтобы
+/// повторный вход из синхронного сообщения не приводил к панике.
 fn with<R>(f: impl FnOnce(&mut Dlg) -> R) -> Option<R> {
-    DLG.with(|d| d.borrow_mut().as_mut().map(|w| f(w)))
+    DLG.with(|d| d.try_borrow_mut().ok().and_then(|mut b| b.as_mut().map(|w| f(w))))
 }
 
 /// Открывает окно (или поднимает уже открытое).
@@ -447,7 +449,19 @@ fn tick() {
     }
 }
 
+/// Оконная процедура: паника внутри неё обрывала бы процесс (unwind
+/// через FFI → abort), поэтому ловим её и продолжаем работать.
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wndproc_inner(hwnd, msg, wp, lp)
+    }));
+    match r {
+        Ok(v) => v,
+        Err(_) => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+fn wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_TIMER => {

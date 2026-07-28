@@ -63,6 +63,10 @@ fn build_recognizer() -> Result<Recognizer, String> {
         .unwrap_or_else(|| cfg.model_path.clone());
     let mut hot = cfg.wake_words.clone();
     hot.extend(cfg.stop_words.clone());
+    if cfg.punctuation {
+        // слова-команды тоже подсказываем модели — иначе «двоеточие» ловится хуже
+        hot.extend(crate::punct::command_words(&cfg.punctuation_words, &cfg.punctuation_prefix));
+    }
     Recognizer::new(&model_path, 16000, &hot, cfg.hotwords_score)
 }
 
@@ -227,13 +231,23 @@ fn stop_dictation(cfg: &Config, stt: &Recognizer, state: &mut State, live: &mut 
     ui::post_state();
 }
 
-/// Готовит текст к вводу: убирает управляющие слова, тримит, ставит заглавную.
+/// Готовит текст к вводу: убирает управляющие слова, расставляет знаки
+/// препинания по голосовым командам, ставит заглавную в начале.
 fn shape(cfg: &Config, raw: &str) -> String {
     let mut ctrl = cfg.stop_words.clone();
     ctrl.extend(cfg.wake_words.clone());
     let cleaned = strip_words(raw, &ctrl);
     if cleaned.is_empty() {
         return String::new();
+    }
+    if cfg.punctuation {
+        // заглавные после точки ставит тот же проход
+        return crate::punct::apply(
+            &cleaned,
+            &cfg.punctuation_words,
+            cfg.capitalize,
+            &cfg.punctuation_prefix,
+        );
     }
     if cfg.capitalize {
         let mut chars = cleaned.chars();
@@ -354,5 +368,20 @@ mod tests {
         assert_eq!(shape(&cfg, "джарвис привет мир"), "Привет мир");
         assert_eq!(shape(&cfg, "это всё стоп"), "Это всё");
         assert_eq!(shape(&cfg, "стоп"), "");
+    }
+
+    #[test]
+    fn shape_punctuates_by_voice() {
+        let cfg = crate::config::Config::default();
+        // команды становятся знаками, слово-активатор по-прежнему убирается
+        assert_eq!(shape(&cfg, "джарвис привет запятая как дела знак вопроса"), "Привет, как дела?");
+        assert_eq!(shape(&cfg, "проверка точка стоп"), "Проверка.");
+    }
+
+    #[test]
+    fn shape_without_punctuation_keeps_words() {
+        let mut cfg = crate::config::Config::default();
+        cfg.punctuation = false;
+        assert_eq!(shape(&cfg, "привет запятая мир"), "Привет запятая мир");
     }
 }

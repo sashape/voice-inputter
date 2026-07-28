@@ -1,6 +1,7 @@
 //! Загрузка/сохранение настроек и поиск ресурсов (модель, DLL).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -27,6 +28,16 @@ pub struct Config {
     /// Режим показа оверлея: "always" | "dictation" | "hidden".
     #[serde(default = "default_overlay_mode")]
     pub overlay_mode: String,
+    /// Знаки препинания голосом: «запятая», «точка», «новая строка»…
+    #[serde(default = "default_true")]
+    pub punctuation: bool,
+    /// Слово-приставка перед знаком («знак запятая»). Пусто — знак ставится
+    /// по одному слову команды.
+    #[serde(default)]
+    pub punctuation_prefix: String,
+    /// Свои команды пунктуации: слово → символ (дополняют встроенные).
+    #[serde(default)]
+    pub punctuation_words: BTreeMap<String, String>,
     /// Проверять обновления на GitHub (раз в сутки, только проверка).
     #[serde(default = "default_true")]
     pub check_updates: bool,
@@ -51,6 +62,9 @@ impl Default for Config {
             overlay_scale: default_scale(),
             live_typing: true,
             overlay_mode: default_overlay_mode(),
+            punctuation: true,
+            punctuation_prefix: String::new(),
+            punctuation_words: BTreeMap::new(),
             check_updates: true,
             hotwords_score: default_hotwords_score(),
             append_space: true,

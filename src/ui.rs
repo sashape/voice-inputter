@@ -132,6 +132,15 @@ thread_local! {
     static UI: RefCell<Ui> = RefCell::new(Ui::default());
 }
 
+/// Доступ к состоянию UI, устойчивый к повторному входу: Windows умеет
+/// синхронно слать сообщения (WM_NCHITTEST, WM_SETCURSOR) прямо из ShowWindow
+/// и SetWindowPos, и обработчик попадает сюда, пока состояние уже занято.
+/// Обычный borrow в такой момент паникует, а паника из оконной процедуры
+/// обрывает процесс — поэтому здесь try_borrow и None вместо падения.
+fn ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
+    UI.with(|c| c.try_borrow_mut().ok().map(|mut u| f(&mut u)))
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -240,7 +249,7 @@ pub fn run() {
         let init_scale = overlay_scale_for(overlay_hwnd);
         let overlay = create_overlay_gdi(init_scale);
 
-        UI.with_borrow_mut(|ui| {
+        ui(|ui| {
             ui.hinstance = hinstance;
             ui.main = main;
             ui.overlay_hwnd = overlay_hwnd;
@@ -308,7 +317,7 @@ fn rebuild_stream(device: Option<&str>) {
         guard.clone()
     };
     let Some(tx) = tx else { return };
-    UI.with_borrow_mut(|ui| {
+    ui(|ui| {
         ui.stream = None; // сначала закрыть старый
         match audio::build_stream(device, tx) {
             Ok(s) => ui.stream = Some(s),
@@ -344,7 +353,19 @@ unsafe fn register_classes(hinstance: windows::Win32::Foundation::HINSTANCE) {
 }
 
 // ── главное окно ─────────────────────────────────────────────────────────
+/// Оконная процедура: паника внутри неё обрывала бы процесс (unwind
+/// через FFI → abort), поэтому ловим её и продолжаем работать.
 extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        main_wndproc_inner(hwnd, msg, wp, lp)
+    }));
+    match r {
+        Ok(v) => v,
+        Err(_) => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+fn main_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_APP_TRAY => {
@@ -419,7 +440,7 @@ fn build_tray_icons() -> [HICON; 3] {
 /// тему: на светлой панели задач белый глиф не виден, нужен тёмный.
 fn refresh_tray_icons(hwnd: HWND) {
     let icons = build_tray_icons();
-    let old = UI.with_borrow_mut(|ui| std::mem::replace(&mut ui.icons, icons));
+    let old = ui(|ui| std::mem::replace(&mut ui.icons, icons)).unwrap_or_default();
     update_tray_icon(hwnd);
     for i in old {
         unsafe {
@@ -497,7 +518,7 @@ fn update_tray_icon(hwnd: HWND) {
     } else {
         0
     };
-    UI.with_borrow(|ui| unsafe {
+    ui(|ui| unsafe {
         let mut nid = tray_data(hwnd, ui.icons[idx]);
         nid.uFlags = NIF_ICON;
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -589,7 +610,19 @@ fn hover_active(ui: &Ui) -> bool {
             .unwrap_or(false)
 }
 
+/// Оконная процедура: паника внутри неё обрывала бы процесс (unwind
+/// через FFI → abort), поэтому ловим её и продолжаем работать.
 extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        overlay_wndproc_inner(hwnd, msg, wp, lp)
+    }));
+    match r {
+        Ok(v) => v,
+        Err(_) => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+fn overlay_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_NCHITTEST => {
@@ -597,9 +630,10 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 let sy = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rc);
-                let (active, scale) = UI.with_borrow(|ui| {
+                let (active, scale) = ui(|ui| {
                     (hover_active(ui), ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0))
-                });
+                })
+                .unwrap_or((false, 1.0));
                 let region = overlay::hit_test(sx - rc.left, sy - rc.top, active, scale);
                 if region == Region::None {
                     LRESULT(HTTRANSPARENT as isize)
@@ -610,7 +644,7 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_MOUSEMOVE => {
                 let x = (lp.0 & 0xFFFF) as i16 as i32;
                 let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
-                UI.with_borrow_mut(|ui| {
+                ui(|ui| {
                     ui.hovered = true;
                     ui.hover_leave_at = None;
                     let scale = ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0);
@@ -630,9 +664,10 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             WM_SETCURSOR => {
                 // рука над кнопками, стрелка в остальных местах пилюли
-                let over_button = UI.with_borrow(|ui| {
+                let over_button = ui(|ui| {
                     matches!(ui.hover_region, Region::Mic | Region::Gear | Region::Close)
-                });
+                })
+                .unwrap_or(false);
                 if over_button {
                     let hand = LoadCursorW(None, IDC_HAND).unwrap_or_default();
                     SetCursor(hand);
@@ -642,7 +677,7 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
             }
             WM_MOUSELEAVE => {
-                UI.with_borrow_mut(|ui| {
+                ui(|ui| {
                     ui.hovered = false;
                     ui.hover_leave_at = Some(Instant::now());
                     ui.tracking_leave = false;
@@ -653,9 +688,10 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_LBUTTONUP => {
                 let x = (lp.0 & 0xFFFF) as i16 as i32;
                 let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
-                let (active, scale) = UI.with_borrow(|ui| {
+                let (active, scale) = ui(|ui| {
                     (hover_active(ui), ui.overlay.as_ref().map(|o| o.scale).unwrap_or(1.0))
-                });
+                })
+                .unwrap_or((false, 1.0));
                 match overlay::hit_test(x, y, active, scale) {
                     Region::Mic => crate::shared::send_worker(WorkerMsg::Toggle),
                     Region::Close => {
@@ -663,7 +699,7 @@ extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         if is_dictating() {
                             crate::shared::send_worker(WorkerMsg::Toggle);
                         }
-                        UI.with_borrow_mut(|ui| ui.dismissed = true);
+                        ui(|ui| ui.dismissed = true);
                     }
                     Region::Gear => open_settings(),
                     _ => {}
@@ -735,7 +771,7 @@ fn tick_overlay() {
         (cfg.overlay_mode.clone(), is_enabled())
     };
 
-    UI.with_borrow_mut(|ui| {
+    ui(|ui| {
         // отслеживаем момент остановки диктовки (для «линжера» в режиме dictation)
         if dictating != ui.last_dictating {
             if dictating {
@@ -941,7 +977,7 @@ fn open_settings() {
 
 /// Снять глобальный хоткей на время захвата нового сочетания в настройках.
 pub fn pause_hotkey() {
-    UI.with_borrow(|ui| unsafe {
+    ui(|ui| unsafe {
         let _ = UnregisterHotKey(ui.main, HOTKEY_ID);
     });
 }
@@ -949,7 +985,7 @@ pub fn pause_hotkey() {
 /// Вернуть глобальный хоткей из конфига.
 pub fn resume_hotkey() {
     let hk = shared().config.lock().unwrap().hotkey.clone();
-    UI.with_borrow(|ui| unsafe {
+    ui(|ui| unsafe {
         reregister_hotkey(ui.main, &hk);
     });
 }
@@ -975,7 +1011,9 @@ pub fn apply(new: crate::config::Config) {
         rebuild_stream(device_name.as_deref());
     }
     if hotkey_changed {
-        unsafe { reregister_hotkey(UI.with_borrow(|ui| ui.main), &hotkey) };
+        if let Some(main) = ui(|ui| ui.main) {
+            unsafe { reregister_hotkey(main, &hotkey) };
+        }
     }
     // при смене слов пересоздаём распознаватель (обновить hotwords-буст)
     if words_changed {

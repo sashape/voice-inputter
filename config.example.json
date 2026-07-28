@@ -10,6 +10,8 @@
     "hotwords_score": 2.0,
     "live_typing": true,
   "check_updates": true,
+  "punctuation": true,
+  "punctuation_prefix": "",
     "append_space": true,
     "capitalize": true
 }

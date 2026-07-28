@@ -17,6 +17,7 @@ mod model;
 mod model_ui;
 mod overlay;
 mod paint;
+mod punct;
 mod settings;
 mod shared;
 mod startup;
@@ -28,7 +29,50 @@ mod win_ui;
 
 use config::Config;
 
+/// Пишет панику в `crash.log` рядом с конфигом и показывает её пользователю:
+/// в релизе консоли нет, иначе падение выглядит как «просто исчезло».
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let bt = std::backtrace::Backtrace::force_capture();
+        let text = format!(
+            "=== {} (unix {secs}) v{}
+{info}
+{bt}
+",
+            "паника",
+            env!("CARGO_PKG_VERSION")
+        );
+        let path = config::data_dir().join("crash.log");
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(text.as_bytes());
+        }
+        eprintln!("{text}");
+        // окно показываем только на первой панике: дальше пишем в лог молча,
+        // иначе повторяющаяся ошибка завалит экран модальными окнами
+        static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            ui::error_box(&format!(
+                "Voice Inputter столкнулся с внутренней ошибкой и записал её в файл.
+
+{info}
+
+Подробности: {}",
+                path.display()
+            ));
+        }
+        prev(info);
+    }));
+}
+
 fn main() {
+    install_panic_hook();
+
     // не даём запустить второй экземпляр (иначе в трее две одинаковые иконки)
     if ui::already_running() {
         ui::error_box("Voice Inputter уже запущен (см. иконку в трее).");

@@ -12,3 +12,7 @@ c*.txt
 debug_trace.txt
 /preview
 *.html
+
+# отладочные артефакты
+stderr.log
+crash.log

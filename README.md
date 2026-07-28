@@ -22,6 +22,10 @@ The default model is Russian, but any sherpa-onnx streaming model works (see
   word, the extra characters are erased with Backspace and retyped.
 - ⌨️ **Unicode input via `SendInput`** — Cyrillic/Latin typed directly, no
   clipboard, no keyboard-layout dependency.
+- ✏️ **Punctuation by voice** — say «запятая», «точка», «знак вопроса»,
+  «тире», «открыть скобку», «новая строка», «новый абзац»… the word becomes the
+  symbol, spacing around it is fixed up and the next sentence starts with a
+  capital. Commands are extendable via `punctuation_words` in `config.json`.
 - 🔄 **Update check** — once a day the app asks GitHub for the latest release
   and, if a newer version exists, shows a tray notification and a menu item that
   opens the release page. Check only — nothing is downloaded or installed
@@ -97,7 +101,7 @@ automatically (int8 variants preferred).
 Everything except `model_path` is editable in the Settings window (tray →
 "Настройки…", or the ⚙ button on the overlay); the rarely-changed knobs
 (`silence_timeout`, `hotwords_score`, `overlay_scale`, `append_space`,
-`capitalize`, `check_updates`) live under "Дополнительно" there. Saving rewrites `config.json`
+`capitalize`, `check_updates`, `punctuation`) live under "Дополнительно" there. Saving rewrites `config.json`
 and applies the change without a restart.
 
 If `config.json` is absent, built-in defaults are used. See
@@ -114,6 +118,11 @@ If `config.json` is absent, built-in defaults are used. See
   "overlay_scale": 1.0,              // extra overlay size multiplier on top of DPI
   "live_typing": true,               // true = type as you speak; false = after a pause
   "check_updates": true,             // daily check for a newer GitHub release
+  "punctuation": true,               // «запятая» → "," and friends
+  "punctuation_prefix": "",          // "" = commands fire on their own; "знак" = «знак точка»
+  "punctuation_words": {             // extra/overriding commands: word → symbol
+    "собака": "@"
+  },
   "append_space": true,
   "capitalize": true
 }
@@ -137,6 +146,7 @@ If `config.json` is absent, built-in defaults are used. See
 | `win_ui.rs` | Shared window kit: palette, fonts, GDI text, layered surface |
 | `startup.rs` | "Run at Windows startup" toggle (`HKCU\...\Run`) |
 | `update.rs` / `http.rs` | Daily release check on GitHub / tiny WinHTTP client |
+| `punct.rs` | Voice punctuation commands → symbols, spacing and capitalization |
 | `paint.rs` | Shared drawing primitives (rounded rects, gradients, blur, easing) |
 | `icons.rs` | Tray icons from the design PNGs, `.ico` builder for the exe |
 | `shared.rs` / `config.rs` | Shared state / `config.json` |
